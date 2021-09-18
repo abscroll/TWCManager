@@ -6,7 +6,7 @@ The SMA EMS module allows fetching of solar Generation and overall Consumption v
 
 ## Configuration
 
-The following table shows the available configuration parameters for the openHAB EMS module.
+The following table shows the available configuration parameters for the SMA EMS module.
 
 | Parameter   | Value         |
 | ----------- | ------------- |
