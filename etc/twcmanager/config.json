@@ -554,6 +554,13 @@
       # battery is then further depleted by the vehicle charging.
           "minBatteryLevel": 90
         },
+      # The SMA module allows fetching of data from SMA WebConnect devices.
+        "SMA": {
+          "enabled": true,
+          "url": "https://192.168.12.3,
+          "user": "user",
+	  "password" : "0000"
+        },
         "SmartMe": {
           "enabled": false,
           "username": "username",
