@@ -2,7 +2,7 @@
     "config": {
         # The settings path will store the dynamic settings which are defined via the web
         # interface
-        "settingsPath": "/etc/twcmanager",
+        "settingsPath": "etc/twcmanager",
 
         # Set wiringMaxAmpsAllTWCs to the maximum number of amps your charger wiring
         # can handle. I default this to a low 6A which should be safe with the minimum
@@ -20,7 +20,7 @@
         # 100 amp breaker * 0.8 = 80 here.
         # IF YOU'RE NOT SURE WHAT TO PUT HERE, ASK THE ELECTRICIAN WHO INSTALLED YOUR
         # CHARGER.
-        "wiringMaxAmpsAllTWCs": 6,
+        "wiringMaxAmpsAllTWCs": 32,
 
         # If all your chargers share a single circuit breaker, set wiringMaxAmpsPerTWC
         # to the same value as wiringMaxAmpsAllTWCs.
@@ -30,7 +30,7 @@
         # wiringMaxAmpsAllTWCs.
         # For example, if you have two TWCs each with a 50A breaker, set
         # wiringMaxAmpsPerTWC = 50 * 0.8 = 40 and wiringMaxAmpsAllTWCs = 40 + 40 = 80.
-        "wiringMaxAmpsPerTWC": 6,
+        "wiringMaxAmpsPerTWC": 32,
 
         # https://teslamotorsclub.com/tmc/threads/model-s-gen2-charger-efficiency-testing.78740/#post-1844789
         # says you're using 10.85% more power (91.75/82.77=1.1085) charging at 5A vs 40A,
@@ -103,7 +103,7 @@
 
         # If you want to use start charging with greenEnergyFlexAmps as it delays stopping
         # you have to set this config to true
-        "useFlexAmpsToStartCharge": false,
+	 "useFlexAmpsToStartCharge": false,
 
         # If the conditions for green energy briefly fail to match, how long should the
         # Track Green Energy policy continue to run?  (Mainly useful if you're adding
@@ -170,7 +170,7 @@
         # DEBUG     10       10     all info.
         # DEBUG2     9       11     more than all info.  ;)
 
-        "logLevel": 20,
+        "logLevel": 10,
 
         # Choose whether to display milliseconds after time on each line of debug info.
         "displayMilliseconds": false,
@@ -197,7 +197,7 @@
     # If you enable more than one, only the first enabled interface will be used
     "interface": {
       "Dummy": {
-        "enabled": false,
+        "enabled": true,
 
         # The dummy module is used for testing. It will simulate an actual
         # slave TWC for the purpose of offline testing of TWCManager.
@@ -206,7 +206,7 @@
         "twcID": "AB"
       },
       "RS485": {
-        "enabled": true,
+        "enabled": false,
 
         # TWC's rs485 port runs at 9600 baud which has been verified with an
         # oscilloscope. Don't change this unless something changes in future hardware.
@@ -217,7 +217,7 @@
         # command line to find your rs485 adapter
         # If you're using a non-USB adapter like an RS485 shield, the value may need to
         # be something like '/dev/serial0'.
-        "port": "/dev/ttyUSB0"
+        "port": "/dev/tty.URT0"
 
         # Note that the RS485 module can also handle simple raw or rfc2217
         # TCP connections. If your requirements are simple, you could use

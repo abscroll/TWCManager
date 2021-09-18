@@ -26,6 +26,7 @@ setup(
         "pymysql==0.9.3; python_version < '3.6'",
         "pymysql; python_version >= '3.6'",
         "pyserial>=3.4",
+        "pysma>=0.6.6",
         "requests>=2.23.0",
         "sentry_sdk>=0.11.2",
         "sysv_ipc < 1.1.0; python_version < '3.6'",
