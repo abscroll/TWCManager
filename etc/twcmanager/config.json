@@ -556,7 +556,7 @@
         },
       # The SMA module allows fetching of data from SMA WebConnect devices.
         "SMA": {
-          "enabled": true,
+          "enabled": false,
           "url": "https://192.168.12.3,
           "user": "user",
 	  "password" : "0000"
