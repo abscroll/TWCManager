@@ -103,7 +103,8 @@ class SMA:
             try:
                 self.sensors = pysma.Sensors()
                 self.sensors.add(pysma.definitions.grid_power)
-                self.sensors.add(pysma.definitions.metering_current_consumption)
+                self.sensors.add(pysma.definitions.metering_power_supplied)
+                self.sensors.add(pysma.definitions.metering_power_absorbed)
                 await self.sma.read(self.sensors)
             except:
                 logger.warning("Sensor request failed!")
@@ -127,16 +128,20 @@ class SMA:
                     logger.debug("{:>25}{:>15} {}".format(sen.name, str(sen.value), sen.unit))
 
             if self.fetchFailed is not True:
-                if self.sensors["metering_current_consumption"].value is not None:
-                    self.consumedW = self.sensors["metering_current_consumption"].value
-                    logger.debug("SMA getConsumption returns " + str(self.consumedW))
-                else:
-                    logger.debug(
-                        "SMA getConsumption fetch failed, using cached values"
-                    )
                 if self.sensors["grid_power"].value is not None:
                     self.generatedW = self.sensors["grid_power"].value
                     logger.debug("SMA getGeneration returns " + str(self.generatedW))
+                    if self.sensors["metering_power_supplied"].value is not None and self.sensors["metering_power_absorbed"].value is not None:
+                        if self.sensors["metering_power_supplied"].value > self.sensors["metering_power_absorbed"].value:
+                            self.consumedW = self.sensors["grid_power"].value - self.sensors["metering_power_supplied"].value
+                            logger.debug("SMA getConsumption returns " + str(self.consumedW) + ": generation " + str(self.sensors["grid_power"].value) + " - given to grid "  + str(self.sensors["metering_power_supplied"].value))
+                        else:
+                            self.consumedW = self.sensors["grid_power"].value + self.sensors["metering_power_absorbed"].value
+                            logger.debug("SMA getConsumption returns " + str(self.consumedW) + ": generation " + str(self.sensors["grid_power"].value) + " + absorbed from grid "  + str(self.sensors["metering_power_absorbed"].value))
+                    else:
+                        logger.debug(
+                            "SMA getConsumption fetch failed, using cached values"
+                        )
                 else:
                     logger.debug(
                         "SMA getGeneration data fetch failed, using cached values"
