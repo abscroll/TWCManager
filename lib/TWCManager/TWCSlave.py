@@ -5,7 +5,7 @@ import re
 import time
 
 
-logger = logging.getLogger(__name__.rsplit(".")[-1])
+logger = logging.getLogger("\u26FD Slave")
 
 
 class TWCSlave:
@@ -447,7 +447,8 @@ class TWCSlave:
 
                 if (
                     now - self.timeLastAmpsOfferedChanged < 60
-                    or now - self.timeReportedAmpsActualChangedSignificantly < 60
+                    or now - self.timeReportedAmpsActualChangedSignificantly
+                    < self.startStopDelay
                     or self.reportedAmpsActual < 4.0
                 ):
                     # We want to tell the car to stop charging. However, it's
@@ -699,16 +700,12 @@ class TWCSlave:
         ):
             desiredAmpsOffered = minAmpsToOffer
 
-        dampenChanges = (
-            True
-            if now
-            - max(
-                self.timeLastAmpsDesiredFlipped,
-                self.timeReportedAmpsActualChangedSignificantly,
-            )
-            < self.startStopDelay
-            else False
-        )
+        dampenChanges = False
+        if self.master.getModuleByName("Policy").policyIsGreen():
+            if (now - self.timeLastAmpsDesiredFlipped) < self.startStopDelay:
+                dampenChanges = True
+        else:
+            self.timeLastAmpsDesiredFlipped = 0
 
         if desiredAmpsOffered < minAmpsToOffer:
             logger.debug(
@@ -944,16 +941,10 @@ class TWCSlave:
             self.timeLastAmpsDesiredFlipped = now
             logger.debug("lastAmpsDesired flipped - now " + str(desiredAmpsOffered))
 
-        # Keep charger on or off if dampening changes. See reasoning above where
+        # Keep charger on if dampening changes. See reasoning above where
         # I don't turn the charger off till it's been on for a bit.
-        if self.reportedAmpsActual > 0 and desiredAmpsOffered == 0 and dampenChanges:
-            logger.debug("Don't stop TWC " + self.master.hex_str(self.TWCID) + " yet.")
-            desiredAmpsOffered = self.minAmpsTWCSupports
-        elif self.lastAmpsOffered == 0 and desiredAmpsOffered > 0 and dampenChanges:
-            logger.debug(
-                "Don't start charging TWC " + self.master.hex_str(self.TWCID) + " yet."
-            )
-            desiredAmpsOffered = 0
+        if dampenChanges and self.reportedAmpsActual > 0:
+            desiredAmpsOffered = max(self.minAmpsTWCSupports, desiredAmpsOffered)
 
         # set_last_amps_offered does some final checks to see if the new
         # desiredAmpsOffered is safe. It should be called after we've picked a

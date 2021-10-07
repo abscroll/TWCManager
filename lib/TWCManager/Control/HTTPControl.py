@@ -15,7 +15,7 @@ import uuid
 import math
 from ww import f
 
-logger = logging.getLogger(__name__.rsplit(".")[-1])
+logger = logging.getLogger("\U0001F3AE HTTP")
 
 
 class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
@@ -66,6 +66,7 @@ def CreateHTTPHandlerClass(master):
     class HTTPControlHandler(BaseHTTPRequestHandler):
         ampsList = []
         fields = {}
+        host = None
         hoursDurationList = []
         master = None
         path = ""
@@ -135,10 +136,14 @@ def CreateHTTPHandlerClass(master):
             self.templateEnv.globals.update(
                 getMFADevices=master.getModuleByName("TeslaAPI").getMFADevices
             )
+            self.templateEnv.globals.update(host=self.host)
             self.templateEnv.globals.update(hoursDurationList=self.hoursDurationList)
             self.templateEnv.globals.update(navbarItem=self.navbar_item)
             self.templateEnv.globals.update(optionList=self.optionList)
             self.templateEnv.globals.update(timeList=self.timeList)
+            self.templateEnv.globals.update(
+                vehicles=master.getModuleByName("TeslaAPI").getCarApiVehicles
+            )
 
             # Set master object
             self.master = master
@@ -532,6 +537,22 @@ def CreateHTTPHandlerClass(master):
                 self.send_response(204)
                 self.end_headers()
 
+            elif self.url.path == "/api/sendTeslaAPICommand":
+                data = json.loads(self.post_data.decode("UTF-8"))
+                command = str(data.get("commandName", None))
+                vehicle = str(data.get("vehicleID", None))
+                params = str(data.get("parameters", None))
+
+                res = master.getModuleByName("TeslaAPI").apiDebugInterface(
+                    command, vehicle, params
+                )
+                if res == True:
+                    self.send_response(200)
+                    self.end_headers()
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+
             elif self.url.path == "/api/setSetting":
                 data = json.loads(self.post_data.decode("UTF-8"))
                 setting = str(data.get("setting", None))
@@ -662,6 +683,16 @@ def CreateHTTPHandlerClass(master):
 
         def do_GET(self):
             self.url = urllib.parse.urlparse(self.path)
+
+            # Determine host header entry
+            try:
+                self.host = self.headers.get("Host", "")
+
+                # Remove port number from domain
+                if ":" in self.host:
+                    self.host = self.host.split(":", 1)[0]
+            except IndexError:
+                self.host = None
 
             # serve local static content files (from './lib/TWCManager/Control/static/' dir)
             if self.url.path.startswith("/static/"):
@@ -890,8 +921,11 @@ def CreateHTTPHandlerClass(master):
 
             if self.url.path == "/teslaAccount/submitCaptcha":
                 captchaCode = self.getFieldValue("captchaCode")
+                interface = self.getFieldValue("interface")
 
-                resp = master.getModuleByName("TeslaAPI").submitCaptchaCode(captchaCode)
+                resp = master.getModuleByName("TeslaAPI").submitCaptchaCode(
+                    captchaCode, interface
+                )
 
                 self.send_response(302)
                 self.send_header("Location", "/teslaAccount/" + str(resp))
@@ -1176,11 +1210,17 @@ def CreateHTTPHandlerClass(master):
                     carapi = master.getModuleByName("TeslaAPI")
                     if key == "carApiBearerToken":
                         carapi.setCarApiBearerToken(self.getFieldValue(key))
+                        # We don't know the token expiry time as it was entered manually,
+                        # but we'll assume it was freshly created which means 45 day expiry
+                        carapi.setCarApiTokenExpireTime(time.time() + 45 * 24 * 60 * 60)
                     elif key == "carApiRefreshToken":
                         carapi.setCarApiRefreshToken(self.getFieldValue(key))
+                        carapi.setCarApiTokenExpireTime(time.time() + 45 * 24 * 60 * 60)
 
-                # Write setting to dictionary
-                master.settings[key] = self.getFieldValue(key)
+                else:
+
+                    # Write setting to dictionary
+                    master.settings[key] = self.getFieldValue(key)
 
             # If Non-Scheduled power action is either Do not Charge or
             # Track Green Energy, set Non-Scheduled power rate to 0

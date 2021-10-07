@@ -2,7 +2,7 @@
 
 [![Stable Release](https://img.shields.io/badge/Stable_Release-1.2.3-blue)](https://github.com/ngardiner/TWCManager/releases/tag/1.2.3)
 [![Development Release](https://img.shields.io/badge/Devel_Release-1.3.0-green.svg)](https://github.com/ngardiner/TWCManager/tree/main)
-![Build Status](https://github.com/ngardiner/TWCManager/actions/workflows/build.yml/badge.svg)
+![Build Status](https://github.com/ngardiner/TWCManager/actions/workflows/test_suite.yml/badge.svg)
 ![GitHub commits](https://img.shields.io/github/commit-activity/m/ngardiner/TWCManager)
 ![Docker Pulls](https://img.shields.io/docker/pulls/twcmanager/twcmanager.svg)
 ![Contributors](https://img.shields.io/github/contributors/ngardiner/TWCManager)
@@ -103,6 +103,7 @@ Status interfaces publish TWCManager status information to external systems. Cur
 | Platform    | Details                                  |
 | ----------- | ---------------------------------------- |
 | TeslaAPI    | Allows start/stop charging via Tesla API |
+| [TeslaMate](docs/modules/Vehicle_TeslaMate.md) | TeslaMate integration (Tesla API Tokens) |
 
 ## Warnings
 
