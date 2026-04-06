@@ -32,6 +32,13 @@
         # wiringMaxAmpsPerTWC = 50 * 0.8 = 40 and wiringMaxAmpsAllTWCs = 40 + 40 = 80.
         "wiringMaxAmpsPerTWC": 6,
 
+        # If you would like to limit the overall grid draw (chargers and house combined),
+        # set maxAmpsAllowedFromGrid to the maximum number of amps you want to draw from
+        # the grid.  This is useful if you have a limited power connection to your house
+        # and you want to make sure you don't exceed it.
+        #"maxAmpsAllowedFromGrid": 6,
+
+
         # https://teslamotorsclub.com/tmc/threads/model-s-gen2-charger-efficiency-testing.78740/#post-1844789
         # says you're using 10.85% more power (91.75/82.77=1.1085) charging at 5A vs 40A,
         # 2.48% more power at 10A vs 40A, and 1.9% more power at 20A vs 40A.  This is
@@ -56,7 +63,8 @@
         # 6A * 230V * 3 = 4140W for three-phase power. Consult an electrician if this
         # doesn't make sense.
         #
-        # https://forums.tesla.com/forum/forums/charging-lowest-amperage-purposely
+        # https://web.archive.org/web/20180807013639/https://forums.tesla.com/forum/forums/charging-lowest-amperage-purposely
+        # and https://teslamotorsclub.com/tmc/threads/low-amp-charging.197800/
         # says another reason to charge at higher power is to preserve battery life.
         # The best charge rate is the capacity of the battery pack / 2.  Home chargers
         # can't reach that rate, so charging as fast as your wiring supports is best
@@ -69,18 +77,15 @@
         # for this many seconds.
         #"startStopDelay": 60,
 
-        # When you have more than one vehicle associated with the Tesla car API and
-        # onlyChargeMultiCarsAtHome = True, cars will only be controlled by the API when
-        # parked at home. For example, when one vehicle is plugged in at home and
-        # another is plugged in at a remote location and you've set TWCManager to stop
-        # charging at the current time, only the one plugged in at home will be stopped
-        # from charging using the car API.
-        # Unfortunately, bugs in the car GPS system may cause a car to not be reported
-        # as at home even if it is, in which case the car might not be charged when you
-        # expect it to be. If you encounter that problem with multiple vehicles, you can
-        # set onlyChargeMultiCarsAtHome = False, but you may encounter the problem of
-        # a car not at home being stopped from charging by the API.
-        "onlyChargeMultiCarsAtHome": true,
+        # Depending on your environment and experience with GPS location quality, you
+        # may want to choose how close a car needs to be to your home location to be
+        # considered "at home". Value is given in feet, one foot is about 0.3 meters.
+        # The default value is 10560 feet (2 miles), as cars in the past had quite some
+        # issues with location accuracy. Do not set this too low, but about 1000 feet
+        # should be safe usually.
+        # Note the covered area is actually not a circle, but a square with a side length
+        # of 2 * atHomeRadius (measured east-west & south-north).
+        # "atHomeRadius": 1000,
 
         # Newer TWCs can report actual voltages.  For older TWCs, you can specify
         # what voltage should be assumed and whether the power is single (1) or
@@ -121,12 +126,40 @@
         # time interval, due to the available amps being set below minimum charge.
         "subtractChargerLoad": false,
 
+        # If your EMS does not return total PV generation but only the power
+        # delivered back to the grid, set treatGenerationAsGridDelivery to
+        # true.
+        "treatGenerationAsGridDelivery": false,
+
         # The minChargeLevel parameter determines the minimum acceptable SOC
         # state for any monitored vehicle. If the SOC is below this value,
         # the car will not be stopped from charging (even if we are not
         # generating sufficient energy). This value is disabled by default;
         # you will need to un-comment it to have it take effect.
         #"minChargeLevel": 10,
+
+        # The client_id of the app registered with Tesla. Registration is
+        # required to use the FleetAPI and Vehicle Command protocol.
+        # See https://developer.tesla.com/docs/fleet-api#authentication
+        #"teslaApiClientID": "client-id-of-registered-app",
+
+        # Since 2024 the Tesla Vehicle Command protocol is required for all
+        # vehicles manufacturered after 2021. The Tesla Vehicle Command proxy
+        # will automatically fall back to the FleetAPI for older vehicles.
+        #
+        # TWCManager does not implement the Tesla Vehicle Command protocol.
+        # Instead it relies on the Tesla Vehicle Command proxy which translates
+        # the FleetAPI REST calls if the destination vehicle supports the
+        # new protocol. This requires the URL of the proxy to be set as
+        # "teslaProxy" and the proxy certificate for validation as
+        # "teslaProxyCert".
+        # See https://github.com/teslamotors/vehicle-command
+        #
+        # The URL of the Tesla HTTP Proxy running locally
+        # "teslaProxy": "https://localhost:4443",
+        #
+        # Only set "teslaProxyCert" when "teslaProxy" is set.
+        #"teslaProxyCert": "/path/to/public_key.pem",
 
         # The cloudUpdateInterval determines how often to poll certain
         # data retrieved from the Tesla API to evaluate policy.
@@ -208,9 +241,15 @@
       "RS485": {
         "enabled": true,
 
-        # TWC's rs485 port runs at 9600 baud which has been verified with an
+        # TWC's RS485 port runs at 9600 baud which has been verified with an
         # oscilloscope. Don't change this unless something changes in future hardware.
         "baud": 9600,
+
+        # This value allows overriding of the default 26 second heartbeat timeout for Slave TWCs.
+        # This value should work in hard-wired systems, but if you are using network
+        # to RS485 adapters and experiencing occasional network loss or latency, this
+        # value can be tuned to extend the timeout.
+        #"slaveTimeout": 26,
 
         # Most users will have only one ttyUSB adapter plugged in and
         # '/dev/ttyUSB0' will work. If not, run 'dmesg |grep ttyUSB' on the
@@ -272,6 +311,11 @@
     # - Evaluate any user defined extensions in the after section below
     # - Outside Scheduled Charging, charge at unscheduled charge rate
     "policy":{
+      # By default, EMS modules are polled only when the data is needed
+      # to track green energy. If you would like to always poll EMS for
+      # display purposes, uncomment this.
+      #"alwaysPollEMS": true,
+
       "engine":{
         "policyCheckInterval": 30
       },
@@ -346,8 +390,6 @@
       #   "match": [ "tm_hour", "tm_hour", "settings.hourResumeTrackGreenEnergy" ],
       #   "condition": [ "gte", "lt", "lte" ],
       #   "value": [ 6, 20, "tm_hour" ],
-      #   "charge_amps": "getMaxAmpsToDivideGreenEnergy()",
-      #   "background_task": "checkGreenEnergy",
       #   "charge_limit": "config.greenEnergyLimit" },
 
       # { "name": "Non Scheduled Charging",
@@ -366,7 +408,9 @@
         # a pi, it may mean considering alternatives such as a remote database
         # to reduce write cycles.
         "Console": {
-            "enabled": true
+            "enabled": true,
+            # simple logging format omits timestamp and colorization
+            #"simple": true
         },
         "FileLogger": {
           "enabled": false,
@@ -420,7 +464,7 @@
                 "ChargeSessions": false,
                 "GreenEnergy": true,
                 "SlavePower": true,
-                "SlaveStatus": true,
+                "SlaveStatus": true
             }
         },
         "MySQL": {
@@ -446,6 +490,14 @@
         # configured simultaneously, currently we will only add together the values recieved from each. This might be
         # useful if you have one interface that provides generation detail and another that provides consumption
         # detail, but if both systems provided both values, it would be duplicated.
+      # The DSMRreader EMS module subscribes to the below MQTT topic to read Consumption/Generation values
+        "DSMRreader": {
+          "enabled": false,
+          "brokerIP": "192.168.1.2",
+          "username": "mqttuser",
+          "password": "mqttpass",
+          "topic": "dsmr/json",
+        },
       # The Efergy server allows fetching of consumption from https://engage.efergy.com/ token is needed
         "Efergy": {
             "enabled": false,
@@ -519,9 +571,13 @@
             "outputGeneration":  "Solar"
         },
         "MQTT": {
-      # MQTT Sensor support for reading generation or consumption data.
-      # This is not yet available.
-          "enabled": false
+          "enabled": false,
+          "brokerIP": "192.168.1.2",
+      # The MQTT EMS module subscribes to the below topics to read Consumption/Generation values
+          "username": "mqttuser",
+          "password": "mqttpass",
+          "topicConsumption": "",
+          "topicGeneration": ""
         },
         "P1Monitor":{
           # Support for P1 Monitor API (https://www.ztatz.nl/)
@@ -573,12 +629,29 @@
           "serverPort": "1080"
         },
       # SolarEdge API, consumed from the internet-based SolarEdge Potal
+      # or directly from a local inverter with smart meter via modbus TCP
+      # NOTE: inverter needs to have modbus TCP enabled - call or email
+      #       SolarEdge to enable it for you or use SetApp to enable it
         "SolarEdge": {
           "enabled": false,
       # API Key must be specified in order to monitor a SolarEdge site
           "apiKey": "",
       # Site ID defines which system to monitor
-          "siteID": ""
+          "siteID": "",
+      ## or local inverter, "apiKey" and "siteID" are ignored if you use this
+      # local IP address or hostname of inverter
+          #"inverterHost": "",
+      # default port is 1502, shouldn't need to be changed
+          #"inverterPort": 1502,
+      # you need 1 smart meter to track consumption, up to 3 are supported
+      # NOTE: if a network part is metered by both a consumption and an export
+      #       meter, only add one of them or consumption will be counted twice
+          #"smartMeters": [{
+      # smart meter names currently may be "Meter1", "Meter2", "Meter3"
+          #  "name": "Meter1",
+      # specify what is metered: "consumption" or "export"
+          #  "type": "export"
+          #}]
         },
       # SolarLog Inverters
         "SolarLog": {
@@ -611,8 +684,18 @@
           "uuidPhotovoltaikW": "00000006-0002-1570-ffff-0123456789ab",
           # Consumption from grid as positive values or Push to grid as negative values.
           "uuidTotalGridW": "1cbbe494-a049-11eb-bcbc-0242ac130002"
+        },
+        # The URL module allows fetching of consumption and generation data from URL items.
+        # If you do not track one of these values (generation or consumption) via URL, leave
+        # the parameter blank, and it will not be retrieved.
+        # Full URLs should use format http[s]://abc/def/[consumptionItemValue|generationItemValue]
+        "URL": {
+          "enabled": false,
+          "url": "http(s)://your/base/url/without/slash/at/end",
+          "consumptionItem": "Consumption item name",
+          "generationItem": "Generation item name"
         }
-    },
+      },
 
     # Status plugins allow us to export status detail out of TWCManager.
     # This will use interfaces such as MQTT or HomeAssistant API to update status for charging, power draw, etc.
@@ -659,13 +742,27 @@
         }
     },
     "vehicle": {
+        "teslaFleetTelemetryMQTT": {
+          "enabled": false,
+          "syncTelemetry": false,
+          "mqtt_host": "192.168.1.1",
+          "mqtt_user": "mqttuser",
+          "mqtt_pass": "mqttpass",
+          "mqtt_prefix": "telemetry"
+        },
+        # The TeslaMate integration allows TWCManager to fetch API key details directly from
+        # your TeslaMate instance's database. This removes the need to manage multiple sets of API
+        # credentials.
+        # Note that since TeslaMate has added encryption to protect the API credentials, you will
+        # need to provide the encryption key to decrypt the API key
         "TeslaMate": {
             "enabled": false,
             "syncTokens": false,
             "db_host": "192.168.1.1",
             "db_name": "teslamate",
             "db_pass": "teslamate",
-            "db_user": "teslamate"
+            "db_user": "teslamate",
+            "encryption_key": "chanegme",
             "syncTelemetry": false,
             "mqtt_host": "192.168.1.1",
             "mqtt_user": "teslamate",

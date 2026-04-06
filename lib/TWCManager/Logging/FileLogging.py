@@ -4,7 +4,6 @@ import logging
 from sys import modules
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from ww import f
 import re
 
 
@@ -12,7 +11,6 @@ logger = logging.getLogger(__name__.rsplit(".")[-1])
 
 
 class FileLogging:
-
     capabilities = {"queryGreenEnergy": False}
     config = None
     configConfig = None

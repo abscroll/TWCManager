@@ -5,7 +5,6 @@ logger = logging.getLogger(__name__.rsplit(".")[-1])
 
 
 class TWCProtocol:
-
     # To avoid a situation where we would have to re-implement TWCManager logic to parse the
     # same messages both for the Dummy interface and for the Slave TWCManager mode, we break out
     # parsing of the protocol to this module.
@@ -24,7 +23,6 @@ class TWCProtocol:
         classname = self.__class__.__name__
 
     def createMessage(self, packet):
-
         # We take some steps to be as autonomous as possible. One of these
         # steps is to automatically fill in fields where we can likely
         # determine the correct value
@@ -67,7 +65,7 @@ class TWCProtocol:
 
         elif packet["Command"] == "GetFirmwareVersion":
             msg = (
-                bytearray(b"\xFB\x1B")
+                bytearray(b"\xfb\x1b")
                 + packet["SenderID"]
                 + packet["RecieverID"]
                 + bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
@@ -79,7 +77,7 @@ class TWCProtocol:
 
         elif packet["Command"] == "SlaveHeartbeat":
             msg = (
-                bytearray(b"\xFD\xE0")
+                bytearray(b"\xfd\xe0")
                 + packet["SenderID"]
                 + packet["RecieverID"]
                 + bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
@@ -91,7 +89,7 @@ class TWCProtocol:
 
         elif packet["Command"] == "SlaveLinkready":
             msg = (
-                bytearray(b"\xFD\xE2")
+                bytearray(b"\xfd\xe2")
                 + packet["SenderID"]
                 + packet["Sign"]
                 + packet["Amps"]
@@ -103,7 +101,6 @@ class TWCProtocol:
             return msg
 
     def parseMessage(self, msg):
-
         # Define protocol packet format
         packet = {"Command": None, "Errors": [], "SenderID": None, "Match": False}
 

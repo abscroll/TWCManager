@@ -27,9 +27,7 @@
 #
 # For more information, please visit http://unlicense.org
 
-import commentjson
 import importlib
-import json
 import logging
 import os.path
 import math
@@ -37,16 +35,16 @@ import re
 import sys
 import time
 import traceback
-from datetime import datetime
+import datetime
+import yaml
 import threading
-from ww import f
 from TWCManager.TWCMaster import TWCMaster
 import requests
 from enum import Enum
 
 
 logging.addLevelName(19, "INFO2")
-logging.addLevelName(18, "INFO4")
+logging.addLevelName(18, "INFO3")
 logging.addLevelName(17, "INFO4")
 logging.addLevelName(16, "INFO5")
 logging.addLevelName(15, "INFO6")
@@ -65,7 +63,7 @@ logging.INFO9 = 12
 logging.DEBUG2 = 9
 
 
-logger = logging.getLogger("\u26FD Manager")
+logger = logging.getLogger("\u26fd Manager")
 
 # Define available modules for the instantiator
 # All listed modules will be loaded at boot time
@@ -83,18 +81,23 @@ modules_available = [
     "Interface.TCP",
     "Policy.Policy",
     "Vehicle.TeslaAPI",
+    "Vehicle.TeslaBLE",
     "Vehicle.TeslaMateVehicle",
+    "Vehicle.FleetTelemetryMQTT",
     "Control.WebIPCControl",
     "Control.HTTPControl",
     "Control.MQTTControl",
     #    "Control.OCPPControl",
+    "EMS.DSMRreader",
     "EMS.Efergy",
+    "EMS.EmonCMS",
     "EMS.Enphase",
     "EMS.Fronius",
     "EMS.Growatt",
     "EMS.HASS",
     "EMS.IotaWatt",
     "EMS.Kostal",
+    "EMS.MQTT",
     "EMS.OpenHab",
     "EMS.OpenWeatherMap",
     "EMS.P1Monitor",
@@ -106,6 +109,7 @@ modules_available = [
     "EMS.TeslaPowerwall2",
     "EMS.TED",
     "EMS.Volkszahler",
+    "EMS.URL",
     "Status.HASSStatus",
     "Status.MQTTStatus",
 ]
@@ -128,7 +132,15 @@ else:
         jsonconfig = open("config.json")
 
 if jsonconfig:
-    config = commentjson.load(jsonconfig)
+    configtext = ""
+    for line in jsonconfig:
+        if line.lstrip().startswith("//") or line.lstrip().startswith("#"):
+            configtext += "\n"
+        else:
+            configtext += line.replace("\t", " ").split("#")[0]
+
+    config = yaml.safe_load(configtext)
+    configtext = None
 else:
     logger.error("Unable to find a configuration file.")
     sys.exit()
@@ -157,6 +169,14 @@ if logLevel == None:
             break
 
 logging.getLogger().setLevel(logLevel)
+
+
+########################################################################
+# Write the PID in order to let a supervisor restart it in case of crash
+PIDfile = config["config"]["settingsPath"] + "/TWCManager.pid"
+PIDTWCManager = open(PIDfile, "w")
+PIDTWCManager.write(str(os.getpid()))
+PIDTWCManager.close()
 
 # All TWCs ship with a random two-byte TWCID. We default to using 0x7777 as our
 # fake TWC ID. There is a 1 in 64535 chance that this ID will match each real
@@ -188,7 +208,7 @@ def hex_str(ba: bytearray):
 
 def time_now():
     global config
-    return datetime.now().strftime(
+    return datetime.datetime.now().strftime(
         "%H:%M:%S" + (".%f" if config["config"]["displayMilliseconds"] else "")
     )
 
@@ -237,6 +257,7 @@ def unescape_msg(inmsg: bytearray, msgLen):
 
 def background_tasks_thread(master):
     carapi = master.getModuleByName("TeslaAPI")
+    carble = master.getModuleByName("TeslaBLE")
 
     while True:
         try:
@@ -249,7 +270,11 @@ def background_tasks_thread(master):
                     # car_api_charge does nothing if it's been under 60 secs since it
                     # was last used so we shouldn't have to worry about calling this
                     # too frequently.
-                    carapi.car_api_charge(task["charge"])
+
+                    # In the new world, we try the BLE command first, and if
+                    # that fails, we try the API
+                    if not carble or not carble.car_api_charge(task["charge"]):
+                        carapi.car_api_charge(task["charge"])
                 elif task["cmd"] == "carApiEmailPassword":
                     carapi.resetCarApiLastErrorTime()
                     carapi.car_api_available(task["email"], task["password"])
@@ -311,6 +336,8 @@ def background_tasks_thread(master):
                         requests.post(task["url"], json=body)
                 elif task["cmd"] == "saveSettings":
                     master.saveSettings()
+                elif task["cmd"] == "sunrise":
+                    update_sunrise_sunset()
 
         except:
             logger.info(
@@ -329,32 +356,38 @@ def background_tasks_thread(master):
 
 
 def check_green_energy():
-    global config, hass, master
-
-    # Check solar panel generation using an API exposed by
-    # the HomeAssistant API.
-    #
-    # You may need to customize the sensor entity_id values
-    # to match those used in your environment. This is configured
-    # in the config section at the top of this file.
-    #
+    global config, master
 
     # Poll all loaded EMS modules for consumption and generation values
     for module in master.getModulesByType("EMS"):
         master.setConsumption(module["name"], module["ref"].getConsumption())
+        if hasattr(module["ref"], "getConsumptionAmps"):
+            master.setConsumptionAmps(
+                module["name"], module["ref"].getConsumptionAmps()
+            )
         master.setGeneration(module["name"], module["ref"].getGeneration())
 
     # Set max amps iff charge_amps isn't specified on the policy.
     if master.getModuleByName("Policy").policyIsGreen():
-        master.setMaxAmpsToDivideAmongSlaves(master.getMaxAmpsToDivideGreenEnergy())
+        master.setMaxAmpsToDivideAmongSlaves(master.getMaxAmpsForTargetGridUsage())
+        master.setLimitAmpsToDivideAmongSlaves(config["config"]["wiringMaxAmpsAllTWCs"])
+    elif config.get("config", {}).get("maxAmpsAllowedFromGrid", None):
+        master.setLimitAmpsToDivideAmongSlaves(
+            master.getMaxAmpsForTargetGridUsage(
+                config["config"]["maxAmpsAllowedFromGrid"]
+            )
+        )
 
 
 def update_statuses():
-
     # Print a status update if we are on track green energy showing the
     # generation and consumption figures
     maxamps = master.getMaxAmpsToDivideAmongSlaves()
-    maxampsDisplay = f("{maxamps:.2f}A")
+    maxampsDisplay = f"{maxamps:.2f}A"
+    subtractChargerLoad = config["config"].get("subtractChargerLoad", False)
+    treatGenerationAsGridDelivery = config["config"].get(
+        "treatGenerationAsGridDelivery", False
+    )
     if master.getModuleByName("Policy").policyIsGreen():
         genwatts = master.getGeneration()
         conwatts = master.getConsumption()
@@ -362,12 +395,16 @@ def update_statuses():
         chgwatts = master.getChargerLoad()
         othwatts = 0
 
-        if config["config"]["subtractChargerLoad"]:
+        if subtractChargerLoad:
             if conwatts > 0:
                 othwatts = conwatts - chgwatts
 
             if conoffset > 0:
                 othwatts -= conoffset
+
+        if treatGenerationAsGridDelivery:
+            # Calculate total generation when it is already consumed by TWC
+            genwatts = max(0, genwatts + chgwatts - conwatts)
 
         # Extra parameters to send with logs
         logExtra = {
@@ -379,76 +416,59 @@ def update_statuses():
         }
 
         if (genwatts or conwatts) and (not conoffset and not othwatts):
-
             logger.info(
                 "Green energy Generates %s, Consumption %s (Charger Load %s)",
-                f("{genwatts:.0f}W"),
-                f("{conwatts:.0f}W"),
-                f("{chgwatts:.0f}W"),
+                f"{genwatts:.0f}W",
+                f"{conwatts:.0f}W",
+                f"{chgwatts:.0f}W",
                 extra=logExtra,
             )
 
         elif (genwatts or conwatts) and othwatts and not conoffset:
-
             logger.info(
                 "Green energy Generates %s, Consumption %s (Charger Load %s, Other Load %s)",
-                f("{genwatts:.0f}W"),
-                f("{conwatts:.0f}W"),
-                f("{chgwatts:.0f}W"),
-                f("{othwatts:.0f}W"),
+                f"{genwatts:.0f}W",
+                f"{conwatts:.0f}W",
+                f"{chgwatts:.0f}W",
+                f"{othwatts:.0f}W",
                 extra=logExtra,
             )
 
         elif (genwatts or conwatts) and othwatts and conoffset > 0:
-
             logger.info(
                 "Green energy Generates %s, Consumption %s (Charger Load %s, Other Load %s, Offset %s)",
-                f("{genwatts:.0f}W"),
-                f("{conwatts:.0f}W"),
-                f("{chgwatts:.0f}W"),
-                f("{othwatts:.0f}W"),
-                f("{conoffset:.0f}W"),
+                f"{genwatts:.0f}W",
+                f"{conwatts:.0f}W",
+                f"{chgwatts:.0f}W",
+                f"{othwatts:.0f}W",
+                f"{conoffset:.0f}W",
                 extra=logExtra,
             )
 
         elif (genwatts or conwatts) and othwatts and conoffset < 0:
-
             logger.info(
                 "Green energy Generates %s (Offset %s), Consumption %s (Charger Load %s, Other Load %s)",
-                f("{genwatts:.0f}W"),
-                f("{(-1 * conoffset):.0f}W"),
-                f("{conwatts:.0f}W"),
-                f("{chgwatts:.0f}W"),
-                f("{othwatts:.0f}W"),
+                f"{genwatts:.0f}W",
+                f"{(-1 * conoffset):.0f}W",
+                f"{conwatts:.0f}W",
+                f"{chgwatts:.0f}W",
+                f"{othwatts:.0f}W",
                 extra=logExtra,
             )
 
         nominalOffer = master.convertWattsToAmps(
             genwatts
-            + (
-                chgwatts
-                if (config["config"]["subtractChargerLoad"] and conwatts == 0)
-                else 0
-            )
-            - (
-                conwatts
-                - (
-                    chgwatts
-                    if (config["config"]["subtractChargerLoad"] and conwatts > 0)
-                    else 0
-                )
-            )
+            + (chgwatts if (subtractChargerLoad and conwatts == 0) else 0)
+            - (conwatts - (chgwatts if (subtractChargerLoad and conwatts > 0) else 0))
         )
         if abs(maxamps - nominalOffer) > 0.005:
-            nominalOfferDisplay = f("{nominalOffer:.2f}A")
+            nominalOfferDisplay = f"{nominalOffer:.2f}A"
             logger.debug(
-                f(
-                    "Offering {maxampsDisplay} instead of {nominalOfferDisplay} to compensate for inexact current draw"
-                )
+                f"Offering {maxampsDisplay} instead of {nominalOfferDisplay} to compensate for inexact current draw"
             )
             conwatts = genwatts - master.convertAmpsToWatts(maxamps)
-        generation = f("{master.convertWattsToAmps(genwatts):.2f}A")
-        consumption = f("{master.convertWattsToAmps(conwatts):.2f}A")
+        generation = f"{master.convertWattsToAmps(genwatts):.2f}A"
+        consumption = f"{master.convertWattsToAmps(conwatts):.2f}A"
         logger.info(
             "Limiting charging to %s - %s = %s.",
             generation,
@@ -464,7 +484,7 @@ def update_statuses():
         )
 
     # Print minimum charge for all charging policies
-    minchg = f("{config['config']['minAmpsPerTWC']}A")
+    minchg = f"{config['config']['minAmpsPerTWC']}A"
     logger.info(
         "Charge when above %s (minAmpsPerTWC).", minchg, extra={"colored": "magenta"}
     )
@@ -485,6 +505,59 @@ def update_statuses():
             master.getMaxAmpsToDivideAmongSlaves(),
             "A",
         )
+
+
+def update_sunrise_sunset():
+    ltNow = time.localtime()
+    latlong = master.getHomeLatLon()
+    if latlong[0] == 10000:
+        # We don't know where home is; keep defaults
+        master.settings["sunrise"] = 6
+        master.settings["sunset"] = 20
+    else:
+        sunrise = 6
+        sunset = 20
+        url = (
+            "https://api.sunrise-sunset.org/json?lat="
+            + str(latlong[0])
+            + "&lng="
+            + str(latlong[1])
+            + "&formatted=0&date="
+            + "-".join([str(ltNow.tm_year), str(ltNow.tm_mon), str(ltNow.tm_mday)])
+        )
+
+        r = {}
+        try:
+            r = requests.get(url).json().get("results")
+        except:
+            pass
+
+        if r.get("sunrise", None):
+            try:
+                dtSunrise = datetime.datetime.astimezone(
+                    datetime.datetime.fromisoformat(r["sunrise"])
+                )
+                sunrise = dtSunrise.hour + (1 if dtSunrise.minute >= 30 else 0)
+            except:
+                pass
+
+        if r.get("sunset", None):
+            try:
+                dtSunset = datetime.datetime.astimezone(
+                    datetime.datetime.fromisoformat(r["sunset"])
+                )
+                sunset = dtSunset.hour + (1 if dtSunset.minute >= 30 else 0)
+            except:
+                pass
+
+        master.settings["sunrise"] = sunrise
+        master.settings["sunset"] = sunset
+
+    tomorrow = datetime.datetime.combine(
+        datetime.datetime.today(), datetime.time(hour=1)
+    ) + datetime.timedelta(days=1)
+    diff = tomorrow - datetime.datetime.now()
+    master.queue_background_task({"cmd": "sunrise"}, diff.total_seconds())
 
 
 #
@@ -588,6 +661,8 @@ backgroundTasksThread = threading.Thread(target=background_tasks_thread, args=(m
 backgroundTasksThread.daemon = True
 backgroundTasksThread.start()
 
+master.queue_background_task({"cmd": "sunrise"}, 30)
+
 logger.info(
     "TWC Manager starting as fake %s with id %02X%02X and sign %02X"
     % (
@@ -639,7 +714,9 @@ while True:
                     # It's been about a second since our last heartbeat.
                     if master.countSlaveTWC() > 0:
                         slaveTWC = master.getSlaveTWC(idxSlaveToSendNextHeartbeat)
-                        if time.time() - slaveTWC.timeLastRx > 26:
+                        if time.time() - slaveTWC.timeLastRx > config.get(
+                            "interfaces", {}
+                        ).get("RS485", {}).get("slaveTimeout", 26):
                             # A real master stops sending heartbeats to a slave
                             # that hasn't responded for ~26 seconds. It may
                             # still send the slave a heartbeat every once in
@@ -829,14 +906,14 @@ while True:
             # voltage/kWh report.
             if (
                 master.lastTWCResponseMsg == b""
-                and msg[0:2] != b"\xFB\xE0"
-                and msg[0:2] != b"\xFD\xE0"
-                and msg[0:2] != b"\xFC\xE1"
-                and msg[0:2] != b"\xFB\xE2"
-                and msg[0:2] != b"\xFD\xE2"
-                and msg[0:2] != b"\xFB\xEB"
-                and msg[0:2] != b"\xFD\xEB"
-                and msg[0:2] != b"\xFD\xE0"
+                and msg[0:2] != b"\xfb\xe0"
+                and msg[0:2] != b"\xfd\xe0"
+                and msg[0:2] != b"\xfc\xe1"
+                and msg[0:2] != b"\xfb\xe2"
+                and msg[0:2] != b"\xfd\xe2"
+                and msg[0:2] != b"\xfb\xeb"
+                and msg[0:2] != b"\xfd\xeb"
+                and msg[0:2] != b"\xfd\xe0"
             ):
                 master.lastTWCResponseMsg = msg
 
@@ -1109,6 +1186,15 @@ while True:
                         },
                     )
 
+                    # Set minAmpsTWCSupports to 1A for 3 phase chargers
+                    if voltsPhaseA >= 200 and voltsPhaseB >= 200 and voltsPhaseC >= 200:
+                        slaveTWC.minAmpsTWCSupports = 1
+                        logger.debug(
+                            "Slave TWC %02X%02X: Set minAmpsTWCSupports to 1A",
+                            senderID[0],
+                            senderID[1],
+                        )
+
                     # Update the timestamp of the last reciept of this message
                     master.lastkWhMessage = time.time()
 
@@ -1167,7 +1253,87 @@ while True:
                         potentialVIN = "".join(slaveTWC.VINData)
 
                         # Ensure we have a valid VIN
-                        if len(potentialVIN) == 17:
+                        vinValid = True
+
+                        if len(potentialVIN) != 17 and len(potentialVIN) != 0:
+                            vinValid = False
+
+                        if vinValid and len(potentialVIN) == 17:
+                            potentialVIN = potentialVIN.upper()
+                            check = potentialVIN[8]
+                            if check == "X":
+                                check = 10
+                            elif check.isdigit():
+                                check = int(check)
+                            else:
+                                vinValid = False
+
+                        if vinValid and len(potentialVIN) == 17:
+                            weights = [
+                                8,
+                                7,
+                                6,
+                                5,
+                                4,
+                                3,
+                                2,
+                                10,
+                                0,
+                                9,
+                                8,
+                                7,
+                                6,
+                                5,
+                                4,
+                                3,
+                                2,
+                            ]
+                            replaceValues = {
+                                "A": 1,
+                                "B": 2,
+                                "C": 3,
+                                "D": 4,
+                                "E": 5,
+                                "F": 6,
+                                "G": 7,
+                                "H": 8,
+                                "J": 1,
+                                "K": 2,
+                                "L": 3,
+                                "M": 4,
+                                "N": 5,
+                                "P": 7,
+                                "R": 9,
+                                "S": 2,
+                                "T": 3,
+                                "U": 4,
+                                "V": 5,
+                                "W": 6,
+                                "X": 7,
+                                "Y": 8,
+                                "Z": 9,
+                                "1": 1,
+                                "2": 2,
+                                "3": 3,
+                                "4": 4,
+                                "5": 5,
+                                "6": 6,
+                                "7": 7,
+                                "8": 8,
+                                "9": 9,
+                                "0": 0,
+                            }
+
+                            sum = 0
+                            for digit, weight in zip(potentialVIN, weights):
+                                if digit not in replaceValues:
+                                    vinValid = False
+                                    break
+                                sum += replaceValues[digit] * weight
+                            if sum % 11 != check:
+                                vinValid = False
+
+                        if vinValid:
                             # Record Vehicle VIN
                             slaveTWC.currentVIN = potentialVIN
 
@@ -1192,7 +1358,7 @@ while True:
 
                             vinPart += 1
                         else:
-                            # Unfortunately the VIN was not the right length.
+                            # Unfortunately the VIN was not received correctly.
                             # Re-request VIN
                             master.queue_background_task(
                                 {
@@ -1532,10 +1698,10 @@ while True:
                             )
                         )
                         master.getInterfaceModule().send(
-                            bytearray(b"\xFD\xEB")
+                            bytearray(b"\xfd\xeb")
                             + fakeTWCID
                             + kWhPacked
-                            + bytearray(b"\x00\xF0\x00\x00\x00\x00\x00")
+                            + bytearray(b"\x00\xf0\x00\x00\x00\x00\x00")
                         )
                 else:
                     msgMatch = re.search(

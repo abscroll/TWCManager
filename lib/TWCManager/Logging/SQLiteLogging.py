@@ -6,7 +6,6 @@ logger = logging.getLogger(__name__.rsplit(".")[-1])
 
 class SQLiteHandler(logging.Handler):
     def __init__(self, db):
-
         logging.Handler.__init__(self)
         self.db = db
         # Initialize the database schema for a database that does not
@@ -47,7 +46,7 @@ class SQLiteHandler(logging.Handler):
         conn = None
         try:
             conn = sqlite3.connect(self.db, uri=True)
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
             logger.exception("Error Opening SQLite3 Databaase: %s", e)
 
         if conn:
@@ -144,7 +143,6 @@ class SQLiteHandler(logging.Handler):
 
 
 class SQLiteLogging:
-
     capabilities = {"queryGreenEnergy": True}
     config = None
     configConfig = None

@@ -5,7 +5,6 @@ logger = logging.getLogger(__name__.rsplit(".")[-1])
 
 
 class Dummy:
-
     enabled = False
     master = None
     msgBuffer = bytes()
@@ -56,7 +55,7 @@ class Dummy:
                         "Command": "SlaveLinkready",
                         "SenderID": self.twcID,
                         "Sign": self.master.getSlaveSign(),
-                        "Amps": bytearray(b"\x1F\x40"),
+                        "Amps": bytearray(b"\x1f\x40"),
                     }
                 )
             )

@@ -5,6 +5,10 @@
 
 name: Automatically format sources
 
+defaults:
+  run:
+    working-directory: ./black
+
 on:
   push:
     branches:
@@ -14,15 +18,19 @@ on:
 jobs:
   build:
     name: Format Sources
-    runs-on: [ "self-hosted", "build_host" ]
+# Temporary while self-hosted infra is down
+#    runs-on: [ "self-hosted", "build_host" ]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
+          path: ./black
           ref: ${{ github.event.push.head.sha }}
-      - name: Set up Python 3.7
-        uses: actions/setup-python@v1
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
         with:
-          python-version: 3.7
+          python-version: 3.12
+          cache: 'pip'
       - name: Install Black
         run: pip install black
       - name: Check if formatting is required for any file

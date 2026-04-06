@@ -1,21 +1,22 @@
+import jinja2
+import json
 import logging
+import math
 import mimetypes
 import os
 import pathlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from datetime import datetime, timedelta
-import jinja2
-import json
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import uuid
-import math
-from ww import f
 
-logger = logging.getLogger("\U0001F3AE HTTP")
+logger = logging.getLogger("\U0001f3ae HTTP")
 
 
 class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
@@ -30,7 +31,6 @@ class HTTPControl:
     status = False
 
     def __init__(self, master):
-
         self.master = master
         try:
             self.configConfig = master.config["config"]
@@ -77,13 +77,19 @@ def CreateHTTPHandlerClass(master):
         url = None
 
         def __init__(self, *args, **kwargs):
-
             # Populate ampsList so that any function which requires a list of supported
             # TWC amps can easily access it
             if not len(self.ampsList):
                 self.ampsList.append([0, "Disabled"])
                 for amp in range(
-                    5, (master.config["config"].get("wiringMaxAmpsPerTWC", 5)) + 1
+                    master.config["config"].get("minAmpsPerTWC", 5),
+                    (
+                        master.config["config"].get(
+                            "wiringMaxAmpsPerTWC",
+                            master.config["config"].get("minAmpsPerTWC", 5),
+                        )
+                    )
+                    + 1,
                 ):
                     self.ampsList.append([amp, str(amp) + "A"])
 
@@ -129,13 +135,13 @@ def CreateHTTPHandlerClass(master):
             # render HTML, we can keep using those even inside jinja2
             self.templateEnv.globals.update(addButton=self.addButton)
             self.templateEnv.globals.update(ampsList=self.ampsList)
+            self.templateEnv.globals.update(
+                apiChallenge=master.getModuleByName("TeslaAPI").getApiChallenge
+            )
             self.templateEnv.globals.update(chargeScheduleDay=self.chargeScheduleDay)
             self.templateEnv.globals.update(checkBox=self.checkBox)
             self.templateEnv.globals.update(checkForUpdates=master.checkForUpdates)
             self.templateEnv.globals.update(doChargeSchedule=self.do_chargeSchedule)
-            self.templateEnv.globals.update(
-                getMFADevices=master.getModuleByName("TeslaAPI").getMFADevices
-            )
             self.templateEnv.globals.update(host=self.host)
             self.templateEnv.globals.update(hoursDurationList=self.hoursDurationList)
             self.templateEnv.globals.update(navbarItem=self.navbar_item)
@@ -338,6 +344,18 @@ def CreateHTTPHandlerClass(master):
                 except BrokenPipeError:
                     self.debugLogAPI("Connection Error: Broken Pipe")
 
+            elif self.url.path == "/api/getActivePolicyAction":
+                data = master.getModuleByName("Policy").getActivePolicyAction()
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+
+                json_data = json.dumps(data)
+                try:
+                    self.wfile.write(json_data.encode("utf-8"))
+                except BrokenPipeError:
+                    self.debugLogAPI("Connection Error: Broken Pipe")
+
             elif self.url.path == "/api/getHistory":
                 output = []
                 now = datetime.now().replace(second=0, microsecond=0).astimezone()
@@ -397,7 +415,6 @@ def CreateHTTPHandlerClass(master):
             self.debugLogAPI("Ending API GET")
 
         def do_API_POST(self):
-
             self.debugLogAPI("Starting API POST")
 
             if self.url.path == "/api/addConsumptionOffset":
@@ -500,7 +517,6 @@ def CreateHTTPHandlerClass(master):
                     self.wfile.write("".encode("utf-8"))
 
                 else:
-
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write("".encode("utf-8"))
@@ -729,20 +745,14 @@ def CreateHTTPHandlerClass(master):
                 {"route": "/debug", "tmpl": "debug.html.j2"},
                 {"route": "/schedule", "tmpl": "schedule.html.j2"},
                 {"route": "/settings", "tmpl": "settings.html.j2"},
-                {"route": "/teslaAccount/login", "error": "insecure"},
-                {"route": "/teslaAccount/mfaCode", "error": "insecure"},
-                {"route": "/teslaAccount/submitCaptcha", "error": "insecure"},
+                {"route": "/settings/homeLocation", "error": "insecure"},
+                {"route": "/settings/save", "error": "insecure"},
+                {"route": "/teslaAccount/saveToken", "error": "insecure"},
                 {"rstart": "/teslaAccount", "tmpl": "main.html.j2"},
+                {"route": "/upgradePrompt", "tmpl": "upgradePrompt.html.j2"},
                 {"rstart": "/vehicleDetail", "tmpl": "vehicleDetail.html.j2"},
                 {"route": "/vehicles", "tmpl": "vehicles.html.j2"},
             ]
-
-            if self.url.path == "/teslaAccount/getCaptchaImage":
-                self.send_response(200)
-                self.send_header("Content-type", "image/svg+xml")
-                self.end_headers()
-                self.wfile.write(master.getModuleByName("TeslaAPI").getCaptchaImage())
-                return
 
             if self.url.path == "/":
                 self.send_response(200)
@@ -758,6 +768,10 @@ def CreateHTTPHandlerClass(master):
                     "TeslaAPI"
                 ).car_api_available()
                 self.scheduledAmpsMax = master.getScheduledAmpsMax()
+
+                self.activeAction = master.getModuleByName(
+                    "Policy"
+                ).getActivePolicyAction()
 
                 # Send the html message
                 page = self.template.render(vars(self))
@@ -776,7 +790,6 @@ def CreateHTTPHandlerClass(master):
                     break
 
             if route and route.get("error", None):
-
                 if route["error"] == "insecure":
                     # For security, these details should be submitted via a POST request
                     # Send a 405 Method Not Allowed in response.
@@ -814,6 +827,34 @@ def CreateHTTPHandlerClass(master):
                 page = self.template.render(self.__dict__)
 
                 page += self.do_get_policy()
+                self.wfile.write(page.encode("utf-8"))
+                return
+
+            if self.url.path == "/upgrade":
+                # This is extremely beta
+                # Attempt a self-update of TWCManager by calling pip
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+
+                self.template = self.templateEnv.get_template("upgrade.html.j2")
+                page = self.template.render(self.__dict__)
+
+                try:
+                    page += subprocess.check_output(
+                        [
+                            sys.executable,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--user",
+                            "--upgrade",
+                            "TWCManager",
+                        ]
+                    ).decode("UTF-8")
+                except subprocess.CalledProcessError as error:
+                    page += "An error occurred attempting upgrade: " + str(error)
+
                 self.wfile.write(page.encode("utf-8"))
                 return
 
@@ -868,7 +909,6 @@ def CreateHTTPHandlerClass(master):
             self.send_response(404)
 
         def do_POST(self):
-
             # Parse URL
             self.url = urllib.parse.urlparse(self.path)
 
@@ -887,50 +927,24 @@ def CreateHTTPHandlerClass(master):
                 self.process_save_settings("debug")
                 return
 
+            if self.url.path == "/debug/saveToggle":
+                self.process_save_settings("debug_toggle")
+                return
+
             if self.url.path == "/schedule/save":
                 # User has submitted schedule.
                 self.process_save_schedule()
+                return
+
+            if self.url.path == "/settings/homeLocation":
+                # User making changes to home location
+                self.process_home_location()
                 return
 
             if self.url.path == "/settings/save":
                 # User has submitted settings.
                 # Call dedicated function
                 self.process_save_settings()
-                return
-
-            if self.url.path == "/teslaAccount/login":
-                # User has submitted Tesla login.
-                # Pass it to the dedicated process_teslalogin function
-                self.process_teslalogin()
-                return
-
-            if self.url.path == "/teslaAccount/mfaCode":
-                transactionID = self.getFieldValue("transactionID")
-                mfaDevice = self.getFieldValue("mfaDevice")
-                mfaCode = self.getFieldValue("mfaCode")
-
-                resp = master.getModuleByName("TeslaAPI").mfaLogin(
-                    transactionID, mfaDevice, mfaCode
-                )
-
-                self.send_response(302)
-                self.send_header("Location", "/teslaAccount/" + str(resp))
-                self.end_headers()
-                self.wfile.write("".encode("utf-8"))
-                return
-
-            if self.url.path == "/teslaAccount/submitCaptcha":
-                captchaCode = self.getFieldValue("captchaCode")
-                interface = self.getFieldValue("interface")
-
-                resp = master.getModuleByName("TeslaAPI").submitCaptchaCode(
-                    captchaCode, interface
-                )
-
-                self.send_response(302)
-                self.send_header("Location", "/teslaAccount/" + str(resp))
-                self.end_headers()
-                self.wfile.write("".encode("utf-8"))
                 return
 
             if self.url.path == "/graphs/dates":
@@ -944,7 +958,6 @@ def CreateHTTPHandlerClass(master):
                     self.send_header("Location", "/graphs")
 
                 else:
-
                     self.process_save_graphs(objIni, objEnd)
                     self.send_response(302)
                     self.send_header("Location", "/graphsP")
@@ -953,8 +966,32 @@ def CreateHTTPHandlerClass(master):
                 self.wfile.write("".encode("utf-8"))
                 return
 
-            if self.url.path == "/vehicle/groupMgmt":
+            if self.url.path == "/teslaAccount/saveToken":
+                # Check if we are skipping Tesla Login submission
+                later = False
+                try:
+                    later = len(self.fields["later"][0])
+                except KeyError:
+                    later = False
 
+                res = ""
+                url = self.getFieldValue("url")
+
+                if later:
+                    master.teslaLoginAskLater = True
+                    res = "later"
+
+                else:
+                    res = master.getModuleByName("TeslaAPI").saveApiToken(url)
+
+                self.send_response(302)
+                self.send_header("Location", "/teslaAccount/" + res)
+
+                self.end_headers()
+                self.wfile.write("".encode("utf-8"))
+                return
+
+            if self.url.path == "/vehicle/groupMgmt":
                 group = self.getFieldValue("group")
                 op = self.getFieldValue("operation")
                 vin = self.getFieldValue("vin")
@@ -990,6 +1027,18 @@ def CreateHTTPHandlerClass(master):
                 self.wfile.write("".encode("utf-8"))
                 return
 
+            if self.url.path == "/vehicle/localMgmt":
+                op = self.getFieldValue("operation")
+                vin = self.getFieldValue("vin")
+
+                self.master.getModuleByName("TeslaBLE").peerWithVehicle(vin)
+
+                self.send_response(302)
+                self.send_header("Location", "/vehicleDetail/" + vin)
+                self.end_headers()
+                self.wfile.write("".encode("utf-8"))
+                return
+
             # All other routes missed, return 404
             self.send_response(404)
             self.end_headers()
@@ -1015,7 +1064,6 @@ def CreateHTTPHandlerClass(master):
             return page
 
         def chargeScheduleDay(self, day):
-
             # Fetch current settings
             sched = master.settings.get("Schedule", {})
             today = sched.get(day, {})
@@ -1099,8 +1147,29 @@ def CreateHTTPHandlerClass(master):
             page += "</div>"
             return page
 
-        def process_save_schedule(self):
+        def process_home_location(self):
+            # If unset was selected, unset account
+            if "unset" in self.fields:
+                del master.settings["homeLat"]
+                del master.settings["homeLon"]
 
+            # If learn was selected, learn location
+            if "learn" in self.fields:
+                loc = self.getFieldValue("vehicle").split(",")
+                master.setHomeLon(loc[0])
+                master.setHomeLat(loc[1])
+
+            # Save Settings
+            master.queue_background_task({"cmd": "saveSettings"})
+
+            # Redirect to the index page
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.end_headers()
+            self.wfile.write("".encode("utf-8"))
+            return
+
+        def process_save_schedule(self):
             # Check that schedule dict exists within settings.
             # If not, this would indicate that this is the first time
             # we have saved the new schedule settings
@@ -1142,9 +1211,9 @@ def CreateHTTPHandlerClass(master):
                         master.settings["Schedule"][match.group(2)] = {}
 
                     # Set per-day settings
-                    master.settings["Schedule"][match.group(2)][
-                        match.group(1)
-                    ] = self.getFieldValue(key)
+                    master.settings["Schedule"][match.group(2)][match.group(1)] = (
+                        self.getFieldValue(key)
+                    )
 
                 else:
                     if master.settings["Schedule"].get("Settings", None) == None:
@@ -1195,12 +1264,10 @@ def CreateHTTPHandlerClass(master):
             return
 
         def process_save_settings(self, page="settings"):
-
             # This function will write the settings submitted from the settings
             # page to the settings dict, before triggering a write of the settings
             # to file
             for key in self.fields:
-
                 # If the key relates to the car API tokens, we need to pass these
                 # to the appropriate module, rather than directly updating the
                 # configuration file (as it would just be overwritten)
@@ -1210,15 +1277,10 @@ def CreateHTTPHandlerClass(master):
                     carapi = master.getModuleByName("TeslaAPI")
                     if key == "carApiBearerToken":
                         carapi.setCarApiBearerToken(self.getFieldValue(key))
-                        # We don't know the token expiry time as it was entered manually,
-                        # but we'll assume it was freshly created which means 45 day expiry
-                        carapi.setCarApiTokenExpireTime(time.time() + 45 * 24 * 60 * 60)
                     elif key == "carApiRefreshToken":
                         carapi.setCarApiRefreshToken(self.getFieldValue(key))
-                        carapi.setCarApiTokenExpireTime(time.time() + 45 * 24 * 60 * 60)
 
                 else:
-
                     # Write setting to dictionary
                     master.settings[key] = self.getFieldValue(key)
 
@@ -1226,15 +1288,17 @@ def CreateHTTPHandlerClass(master):
             # Track Green Energy, set Non-Scheduled power rate to 0
             if int(master.settings.get("nonScheduledAction", 1)) > 1:
                 master.settings["nonScheduledAmpsMax"] = 0
-            master.queue_background_task({"cmd": "saveSettings"})
 
             # If triggered from the Debug page (not settings page), we need to
             # set certain settings to false if they were not seen in the
             # request data - This is because Check Boxes don't have a value
             # if they aren't set
+            if page == "debug_toggle":
+                if "enableDebugCommands" not in self.fields:
+                    master.settings["enableDebugCommands"] = 0
+
             if page == "debug":
                 checkboxes = [
-                    "enableDebugCommands",
                     "spikeAmpsProactively",
                     "spikeAmpsReactively",
                 ]
@@ -1242,57 +1306,15 @@ def CreateHTTPHandlerClass(master):
                     if checkbox not in self.fields:
                         master.settings[checkbox] = 0
 
+            # Save Settings
+            master.queue_background_task({"cmd": "saveSettings"})
+
             # Redirect to the index page
             self.send_response(302)
             self.send_header("Location", "/")
             self.end_headers()
             self.wfile.write("".encode("utf-8"))
             return
-
-        def process_teslalogin(self):
-            # Check if we are skipping Tesla Login submission
-
-            if not master.teslaLoginAskLater:
-                later = False
-                try:
-                    later = len(self.fields["later"][0])
-                except KeyError:
-                    later = False
-
-                if later:
-                    master.teslaLoginAskLater = True
-
-            if not master.teslaLoginAskLater:
-                # Connect to Tesla API
-
-                carapi = master.getModuleByName("TeslaAPI")
-                carapi.resetCarApiLastErrorTime()
-                try:
-                    ret = carapi.apiLogin(
-                        self.fields["email"][0], self.fields["password"][0]
-                    )
-                except KeyError:
-                    self.send_response(302)
-                    self.send_header("Location", "/teslaAccount/NotSpecified")
-                    self.end_headers()
-                    self.wfile.write("".encode("utf-8"))
-                    return
-
-                # Redirect to an index page with output based on the return state of
-                # the function
-                self.send_response(302)
-                self.send_header("Location", "/teslaAccount/" + str(ret))
-                self.end_headers()
-                self.wfile.write("".encode("utf-8"))
-                return
-            else:
-                # User has asked to skip Tesla Account submission for this session
-                # Redirect back to /
-                self.send_response(302)
-                self.send_header("Location", "/")
-                self.end_headers()
-                self.wfile.write("".encode("utf-8"))
-                return
 
         def process_save_graphs(self, initial, end):
             # Check that Graphs dict exists within settings.
