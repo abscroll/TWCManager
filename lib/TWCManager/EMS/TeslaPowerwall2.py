@@ -2,14 +2,10 @@
 import logging
 import time
 
-from ww import f
-
-
-logger = logging.getLogger(__name__.rsplit(".")[-1])
+logger = logging.getLogger("\U000026c5 TeslaPwl")
 
 
 class TeslaPowerwall2:
-
     import requests
     import urllib3
     import json as json
@@ -164,7 +160,6 @@ class TeslaPowerwall2:
                 )
 
     def getConsumption(self):
-
         if not self.status:
             logger.debug("Powerwall2 EMS Module Disabled. Skipping getConsumption")
             return 0
@@ -173,7 +168,6 @@ class TeslaPowerwall2:
         return float(self.consumedW)
 
     def getGeneration(self):
-
         if not self.status:
             logger.debug("Powerwall2 EMS Module Disabled. Skipping getGeneration")
             return 0
@@ -193,13 +187,11 @@ class TeslaPowerwall2:
         return float(self.generatedW)
 
     def getPWJson(self, path):
-
         (lastTime, lastData) = (
             self.lastFetch[path] if path in self.lastFetch else (0, dict())
         )
 
         if (int(time.time()) - lastTime) > self.cacheTime:
-
             # Fetch the specified URL from Powerwall and return the data
 
             # Get a login token, if password authentication is enabled
@@ -246,6 +238,7 @@ class TeslaPowerwall2:
         carapi = self.master.getModuleByName("TeslaAPI")
         token = carapi.getCarApiBearerToken()
         expiry = carapi.getCarApiTokenExpireTime()
+        baseURL = carapi.getCarApiBaseURL()
         now = time.time()
         key = "CLOUD/live_status"
 
@@ -254,19 +247,20 @@ class TeslaPowerwall2:
         )
 
         if (int(time.time()) - lastTime) > self.cloudCacheTime:
-
             if token and now < expiry:
                 headers = {
                     "Authorization": "Bearer " + token,
                     "Content-Type": "application/json",
                 }
                 if not self.cloudID:
-                    url = "https://owner-api.teslamotors.com/api/1/products"
+                    url = baseURL.replace("vehicles", "products")
                     bodyjson = None
                     products = list()
 
                     try:
-                        r = self.httpSession.get(url, headers=headers)
+                        r = self.httpSession.get(
+                            url, headers=headers, verify=carapi.verifyCert
+                        )
                         r.raise_for_status()
                         bodyjson = r.json()
                         products = [
@@ -285,24 +279,28 @@ class TeslaPowerwall2:
                         logger.info(
                             "Multiple Powerwall sites linked to your Tesla account.  Please specify the correct site ID in your config.json."
                         )
-                        for (site, name) in products:
-                            logger.info(f("   {site}: {name}"))
+                        for site, name in products:
+                            logger.info(f"   {site}: {name}")
                     else:
                         logger.info("Couldn't find a Powerwall on your Tesla account.")
 
                 if self.cloudID:
-                    url = f(
-                        "https://owner-api.teslamotors.com/api/1/energy_sites/{self.cloudID}/live_status"
-                    )
+                    url = baseURL.replace("vehicles", "energy_sites")
+                    url = f"{url}/{self.cloudID}/live_status"
                     bodyjson = None
-                    result = dict()
 
                     try:
-                        r = self.httpSession.get(url, headers=headers)
+                        r = self.httpSession.get(
+                            url, headers=headers, verify=carapi.verifyCert
+                        )
                         r.raise_for_status()
                         bodyjson = r.json()
                         lastData = bodyjson["response"]
                     except:
+                        if r.status_code is 403:
+                            logger.warn(
+                                "Error fetching Powerwall cloud data; does your API token have energy_device_data scope?"
+                            )
                         pass
 
             self.lastFetch[key] = (now, lastData)

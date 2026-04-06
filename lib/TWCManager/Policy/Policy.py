@@ -1,13 +1,11 @@
 import logging
 import time
-from ww import f
 
 
-logger = logging.getLogger("\u26FD Policy")
+logger = logging.getLogger("\u26fd Policy")
 
 
 class Policy:
-
     active_policy = None
 
     # This is the default charge policy.  It can be overridden or extended.
@@ -47,7 +45,7 @@ class Policy:
             "name": "Track Green Energy",
             "match": ["tm_hour", "tm_hour", "settings.hourResumeTrackGreenEnergy"],
             "condition": ["gte", "lt", "lte"],
-            "value": [6, 20, "tm_hour"],
+            "value": ["settings.sunrise", "settings.sunset", "tm_hour"],
             "background_task": "checkGreenEnergy",
             "allowed_flex": "config.greenEnergyFlexAmps",
             "charge_limit": "config.greenEnergyLimit",
@@ -97,15 +95,13 @@ class Policy:
                 config_extend = config_policy.get("extend", {})
 
                 # Get additional restrictions
-                for (name, restrictions) in config_extend.get(
-                    "restrictions", {}
-                ).items():
+                for name, restrictions in config_extend.get("restrictions", {}).items():
                     restricted = self.getPolicyByName(name)
                     for key in ("match", "condition", "value"):
                         restricted[key] += restrictions.get(key, [])
 
                 # Get webhooks
-                for (name, hooks) in config_extend.get("webhooks", {}).items():
+                for name, hooks in config_extend.get("webhooks", {}).items():
                     hooked = self.getPolicyByName(name)
                     hooked["webhooks"] = hooks
 
@@ -119,7 +115,7 @@ class Policy:
                 #   After - Inserted before Non-Scheduled Charging
                 #   Before - Inserted after Charge Now
                 #   Emergency - Inserted at the beginning
-                for (name, position) in [("after", 3), ("before", 1), ("emergency", 0)]:
+                for name, position in [("after", 3), ("before", 1), ("emergency", 0)]:
                     self.charge_policy[position:position] = config_extend.get(name, [])
 
             # Set the Policy Check Interval if specified
@@ -149,7 +145,6 @@ class Policy:
             self.lastPolicyCheck = time.time()
 
         for policy in self.charge_policy:
-
             # Check if the policy is within its latching period
             latched = False
             if "__latchTime" in policy:
@@ -194,6 +189,11 @@ class Policy:
             self.limitOverride = False
             self.fireWebhook("enter")
 
+            # Clear stopAskingToStartCharging so we try charging each car at
+            # least once
+            for vehicle in self.master.getModuleByName("TeslaAPI").getCarApiVehicles():
+                vehicle.stopAskingToStartCharging = False
+
         if updateLatch and "latch_period" in policy:
             policy["__latchTime"] = time.time() + policy["latch_period"] * 60
 
@@ -216,6 +216,14 @@ class Policy:
         if bgt:
             self.master.queue_background_task({"cmd": bgt})
 
+        # If we are not checking green energy already but we need to, queue that
+        # as well.
+        if bgt is not "checkGreenEnergy":
+            alwaysPoll = self.config.get("policy", {}).get("alwaysPollEMS", False)
+            maxAmps = self.config.get("config", {}).get("maxAmpsAllowedFromGrid", None)
+            if alwaysPoll or maxAmps or self.policyIsGreen():
+                self.master.queue_background_task({"cmd": "checkGreenEnergy"})
+
         # If a charge limit is defined for this policy, apply it
         limit = limit = self.policyValue(policy.get("charge_limit", -1))
         if self.limitOverride:
@@ -229,6 +237,16 @@ class Policy:
             limit = -1
         self.master.queue_background_task({"cmd": "applyChargeLimit", "limit": limit})
 
+        # Report current policy via Status modules
+        for module in self.master.getModulesByType("Status"):
+            module["ref"].setStatus(
+                bytes("all", "UTF-8"),
+                "current_policy",
+                "currentPolicy",
+                policy["name"],
+                "",
+            )
+
     def fireWebhook(self, hook):
         policy = self.getPolicyByName(self.active_policy)
         if policy:
@@ -241,6 +259,25 @@ class Policy:
             if policy["name"] == name:
                 return policy
         return None
+
+    def getActivePolicyAction(self):
+        # getActivePolicyAction returns an integer value depending on what
+        # charging action the currently active policy is following. Values
+        # correspond to nonScheduledAction values in settings.json:
+        # 1 ... fixed rate charging
+        # 2 ... do not charge
+        # 3 ... track green energy charging
+        # <None> will be returned if self.active_policy is not (yet) set
+        if self.active_policy == None:
+            return None
+        if self.policyIsGreen():
+            return 3
+        else:
+            policy = self.getPolicyByName(self.active_policy)
+            if int(self.policyValue(policy.get("charge_amps", 0))) > 0:
+                return 1
+            else:
+                return 2
 
     def policyValue(self, value):
         # policyValue is a macro to allow charging policy to refer to things
@@ -264,8 +301,11 @@ class Policy:
         #
         # If value refers to a function, execute the function and capture the
         # output
-        if value == "getMaxAmpsToDivideGreenEnergy()":
-            return self.master.getMaxAmpsToDivideGreenEnergy()
+        if value in [
+            "getMaxAmpsToDivideGreenEnergy()",
+            "getMaxAmpsForTargetGridUsage()",
+        ]:
+            return self.master.getMaxAmpsForTargetGridUsage()
         elif value == "checkScheduledCharging()":
             return self.master.checkScheduledCharging()
 
@@ -290,10 +330,7 @@ class Policy:
     def policyIsGreen(self):
         current = self.getPolicyByName(self.active_policy)
         if current:
-            return (
-                current.get("background_task", "") == "checkGreenEnergy"
-                and current.get("charge_amps", None) == None
-            )
+            return current.get("charge_amps", None) is None
         return False
 
     def doesConditionMatch(self, match, condition, value, exitOn):
@@ -302,9 +339,7 @@ class Policy:
 
         logger.log(
             logging.INFO8,
-            f(
-                "Evaluating Policy match (%s [{matchValue}]), condition (%s), value (%s)"
-            ),
+            f"Evaluating Policy match (%s [{matchValue}]), condition (%s), value (%s)",
             match,
             condition,
             value,

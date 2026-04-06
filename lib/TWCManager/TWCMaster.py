@@ -9,17 +9,15 @@ import queue
 from sys import modules
 import threading
 import time
-from ww import f
 import math
 import random
 import requests
 import bisect
 
-logger = logging.getLogger("\u26FD Master")
+logger = logging.getLogger("\u26fd Master")
 
 
 class TWCMaster:
-
     allowed_flex = 0
     backgroundTasksQueue = queue.Queue()
     backgroundTasksCmds = {}
@@ -27,6 +25,7 @@ class TWCMaster:
     backgroundTasksDelayed = []
     config = None
     consumptionValues = {}
+    consumptionAmpsValues = {}
     debugOutputToFile = False
     generationValues = {}
     lastkWhMessage = time.time()
@@ -34,6 +33,7 @@ class TWCMaster:
     lastSaveFailed = 0
     lastTWCResponseMsg = None
     lastUpdateCheck = 0
+    limitAmpsToDivideAmongSlaves = 0
     masterTWCID = ""
     maxAmpsToDivideAmongSlaves = 0
     modules = {}
@@ -65,10 +65,11 @@ class TWCMaster:
     stopTimeout = datetime.max
     spikeAmpsToCancel6ALimit = 16
     subtractChargerLoad = False
+    treatGenerationAsGridDelivery = False
     teslaLoginAskLater = False
     TWCID = None
     updateVersion = False
-    version = "1.2.4"
+    version = "1.3.2"
 
     # TWCs send a seemingly-random byte after their 2-byte TWC id in a number of
     # messages. I call this byte their "Sign" for lack of a better term. The byte
@@ -83,8 +84,15 @@ class TWCMaster:
         self.config = config
         self.debugOutputToFile = config["config"].get("debugOutputToFile", False)
         self.TWCID = TWCID
-        self.subtractChargerLoad = config["config"]["subtractChargerLoad"]
+        self.subtractChargerLoad = config["config"].get("subtractChargerLoad", False)
+        self.treatGenerationAsGridDelivery = config["config"].get(
+            "treatGenerationAsGridDelivery", False
+        )
         self.advanceHistorySnap()
+        if config["config"].get("maxAmpsAllowedFromGrid", None) is None:
+            self.setLimitAmpsToDivideAmongSlaves(
+                self.config["config"]["wiringMaxAmpsAllTWCs"]
+            )
 
         # Register ourself as a module, allows lookups via the Module architecture
         self.registerModule({"name": "master", "ref": self, "type": "Master"})
@@ -117,21 +125,24 @@ class TWCMaster:
 
             # Fetch the JSON data from PyPi for our package
             url = "https://pypi.org/pypi/twcmanager/json"
+            req = None
+            pkgInfo = None
 
             try:
                 req = requests.get(url)
                 logger.log(logging.INFO8, "Requesting PyPi package info " + str(req))
                 pkgInfo = json.loads(req.text)
             except requests.exceptions.RequestException:
-                logger.info("Failed to fetch package details " + url)
-                logger.log(logging.INFO6, "Response: " + req.text)
+                logger.info("Failed to fetch package details: " + url)
+                if req:
+                    logger.log(logging.INFO6, "Response: " + req.text)
                 pass
             except json.decoder.JSONDecodeError:
                 logger.info("Could not parse JSON result from " + url)
                 logger.log(logging.INFO6, "Response: " + req.text)
                 pass
 
-            if pkgInfo.get("info", {}).get("version", None):
+            if pkgInfo and pkgInfo.get("info", {}).get("version", None):
                 if pkgInfo["info"]["version"] != self.version:
                     # Versions don't match. Let's make sure the new one really is newer
                     current_arr = [int(v) for v in self.version.split(".")]
@@ -164,7 +175,6 @@ class TWCMaster:
         return match
 
     def checkScheduledCharging(self):
-
         # Check if we're within the hours we must use scheduledAmpsMax instead
         # of nonScheduledAmpsMax
         blnUseScheduledAmps = 0
@@ -258,7 +268,6 @@ class TWCMaster:
             del self.backgroundTasksCmds[task["cmd"]]
 
     def doneBackgroundTask(self, task):
-
         # Delete task['cmd'] from backgroundTasksCmds such that
         # queue_background_task() can queue another task['cmd'] in the future.
         if "cmd" in task:
@@ -331,7 +340,9 @@ class TWCMaster:
         return self.settings["kWhDelivered"]
 
     def getMaxAmpsToDivideAmongSlaves(self):
-        if self.maxAmpsToDivideAmongSlaves > 0:
+        if self.maxAmpsToDivideAmongSlaves > self.limitAmpsToDivideAmongSlaves:
+            return self.limitAmpsToDivideAmongSlaves
+        elif self.maxAmpsToDivideAmongSlaves > 0:
             return self.maxAmpsToDivideAmongSlaves
         else:
             return 0
@@ -426,7 +437,6 @@ class TWCMaster:
         return int(self.settings.get("scheduledAmpsFlexStart", False))
 
     def getSlaveLifetimekWh(self):
-
         # This function is called from a Scheduled Task
         # If it's been at least 1 minute, then query all known Slave TWCs
         # to determine their lifetime kWh and per-phase voltages
@@ -434,7 +444,7 @@ class TWCMaster:
         if now >= self.lastkWhPoll + 60:
             for slaveTWC in self.getSlaveTWCs():
                 self.getInterfaceModule().send(
-                    bytearray(b"\xFB\xEB")
+                    bytearray(b"\xfb\xeb")
                     + self.TWCID
                     + slaveTWC.TWCID
                     + bytearray(b"\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -489,12 +499,16 @@ class TWCMaster:
             and scheduledChargingDays > 0
             and self.getScheduledAmpsMax() > 0,
             "amps": self.getScheduledAmpsMax(),
-            "startingMinute": int(data["scheduledChargingStartHour"] * 60)
-            if data["scheduledChargingStartHour"] >= 0
-            else -1,
-            "endingMinute": int(data["scheduledChargingEndHour"] * 60)
-            if data["scheduledChargingEndHour"] >= 0
-            else -1,
+            "startingMinute": (
+                int(data["scheduledChargingStartHour"] * 60)
+                if data["scheduledChargingStartHour"] >= 0
+                else -1
+            ),
+            "endingMinute": (
+                int(data["scheduledChargingEndHour"] * 60)
+                if data["scheduledChargingEndHour"] >= 0
+                else -1
+            ),
             "monday": (scheduledChargingDays & 1) == 1,
             "tuesday": (scheduledChargingDays & 2) == 2,
             "wednesday": (scheduledChargingDays & 4) == 4,
@@ -503,12 +517,12 @@ class TWCMaster:
             "saturday": (scheduledChargingDays & 32) == 32,
             "sunday": (scheduledChargingDays & 64) == 64,
             "flexStartEnabled": self.getScheduledAmpsFlexStart(),
-            "flexStartingMinute": int(scheduledFlexTime[0] * 60)
-            if scheduledFlexTime[0] >= 0
-            else -1,
-            "flexEndingMinute": int(scheduledFlexTime[1] * 60)
-            if scheduledFlexTime[1] >= 0
-            else -1,
+            "flexStartingMinute": (
+                int(scheduledFlexTime[0] * 60) if scheduledFlexTime[0] >= 0 else -1
+            ),
+            "flexEndingMinute": (
+                int(scheduledFlexTime[1] * 60) if scheduledFlexTime[1] >= 0 else -1
+            ),
             "flexMonday": (scheduledFlexTime[2] & 1) == 1,
             "flexTuesday": (scheduledFlexTime[2] & 2) == 2,
             "flexWednesday": (scheduledFlexTime[2] & 4) == 4,
@@ -536,11 +550,11 @@ class TWCMaster:
     def getVehicleVIN(self, slaveID, part):
         prefixByte = None
         if int(part) == 0:
-            prefixByte = bytearray(b"\xFB\xEE")
+            prefixByte = bytearray(b"\xfb\xee")
         if int(part) == 1:
-            prefixByte = bytearray(b"\xFB\xEF")
+            prefixByte = bytearray(b"\xfb\xef")
         if int(part) == 2:
-            prefixByte = bytearray(b"\xFB\xF1")
+            prefixByte = bytearray(b"\xfb\xf1")
 
         if prefixByte:
             self.getInterfaceModule().send(
@@ -581,6 +595,17 @@ class TWCMaster:
 
         return float(consumptionVal)
 
+    def getConsumptionAmps(self):
+        consumptionAmpsVal = 0
+
+        for key in self.consumptionAmpsValues:
+            consumptionAmpsVal += float(self.consumptionAmpsValues[key])
+
+        if consumptionAmpsVal < 0:
+            consumptionAmpsVal = 0
+
+        return float(consumptionAmpsVal)
+
     def getFakeTWCID(self):
         return self.TWCID
 
@@ -596,7 +621,7 @@ class TWCMaster:
 
         offset = self.getConsumptionOffset()
         if offset < 0:
-            generationVal += -1 * offset
+            generationVal -= offset
 
         return float(generationVal)
 
@@ -607,7 +632,9 @@ class TWCMaster:
         generationOffset = self.getConsumption()
         if self.subtractChargerLoad:
             generationOffset -= self.getChargerLoad()
-        if generationOffset < 0:
+        # Allow negative offset when EMS reports grid delivery instead of
+        # generation. This means the offset increases the total generation.
+        if generationOffset < 0 and not self.treatGenerationAsGridDelivery:
             generationOffset = 0
         return float(generationOffset)
 
@@ -615,39 +642,42 @@ class TWCMaster:
         # Returns Lat/Lon coordinates to check if car location is
         # at home
         latlon = [10000, 10000]
-        latlon[0] = self.settings.get("homeLat", 10000)
-        latlon[1] = self.settings.get("homeLon", 10000)
+        latlon[0] = float(self.settings.get("homeLat", 10000))
+        latlon[1] = float(self.settings.get("homeLon", 10000))
         return latlon
 
     def getMasterHeartbeatOverride(self):
         return self.overrideMasterHeartbeatData
 
-    def getMaxAmpsToDivideGreenEnergy(self):
-        # Calculate our current generation and consumption in watts
-        generationW = float(self.getGeneration())
-        consumptionW = float(self.getConsumption())
+    def getMaxAmpsForTargetGridUsage(self, targetA=0):
+        # Calculate our current generation and consumption in amps
+        generationA = float(self.convertWattsToAmps(self.getGeneration()))
+        consumptionA = float(self.getConsumptionAmps())
 
-        # Calculate what we should offer to align with green energy
+        # Use consumption on all phases when the target is 0 or consumptionA
+        # is not available
+        if targetA == 0 or not consumptionA:
+            consumptionA = float(self.convertWattsToAmps(self.getConsumption()))
+        availableA = generationA + targetA - consumptionA
+
+        # Calculate what we should offer to match the target (0 for green)
         #
         # The current offered shouldn't increase more than / must
-        # decrease at least the current gap between generation and
+        # decrease at least the current gap between available power and
         # consumption.
 
         currentOffer = max(
-            self.getMaxAmpsToDivideAmongSlaves(),
+            int(self.getMaxAmpsToDivideAmongSlaves()),
             self.num_cars_charging_now() * self.config["config"]["minAmpsPerTWC"],
         )
-        newOffer = currentOffer + self.convertWattsToAmps(generationW - consumptionW)
+        newOffer = currentOffer + availableA
 
         # This is the *de novo* calculation of how much we can offer
-        #
-        # Fetches and uses consumptionW separately
-        generationOffset = self.getGenerationOffset()
-        solarW = float(generationW - generationOffset)
-        solarAmps = self.convertWattsToAmps(solarW)
+        generationOffsetA = self.convertWattsToAmps(self.getGenerationOffset())
+        availableA = float(generationA + targetA - generationOffsetA)
 
         # Offer the smaller of the two, but not less than zero.
-        amps = max(min(newOffer, solarAmps / self.getRealPowerFactor(solarAmps)), 0)
+        amps = max(min(newOffer, availableA / self.getRealPowerFactor(availableA)), 0)
         return round(amps, 2)
 
     def getNormalChargeLimit(self, ID):
@@ -655,6 +685,10 @@ class TWCMaster:
             result = self.settings["chargeLimits"][str(ID)]
             if type(result) is int:
                 result = (result, 0)
+            if result[0] is None:
+                result[0] = 0
+            if result[1] is None:
+                result[1] = 0
             return (True, result[0], result[1])
         return (False, None, None)
 
@@ -682,7 +716,9 @@ class TWCMaster:
 
     def getVoltageMeasurement(self):
         slavesWithVoltage = [
-            slave for slave in self.getSlaveTWCs() if slave.voltsPhaseA > 0
+            slave
+            for slave in self.getSlaveTWCs()
+            if (slave.voltsPhaseA > 0 or slave.voltsPhaseB > 0 or slave.voltsPhaseC > 0)
         ]
         if len(slavesWithVoltage) == 0:
             # No slaves support returning voltage
@@ -693,28 +729,35 @@ class TWCMaster:
 
         total = 0
         phases = 0
-        if any([slave.voltsPhaseC > 0 for slave in slavesWithVoltage]):
-            # Three-phase system
-            phases = 3
-            if all([slave.voltsPhaseC > 0 for slave in slavesWithVoltage]):
-                total = sum(
-                    [
-                        (slave.voltsPhaseA + slave.voltsPhaseB + slave.voltsPhaseC)
-                        for slave in slavesWithVoltage
-                    ]
-                )
+
+        # Detect number of active phases
+        for slave in slavesWithVoltage:
+            localPhases = 0
+            if slave.voltsPhaseA:
+                localPhases += 1
+            if slave.voltsPhaseB:
+                localPhases += 1
+            if slave.voltsPhaseC:
+                localPhases += 1
+
+            if phases:
+                if localPhases != phases:
+                    logger.info(
+                        "FATAL:  Mix of multi-phase TWC configurations not currently supported."
+                    )
+                    return (
+                        self.config["config"].get("defaultVoltage", 240),
+                        self.config["config"].get("numberOfPhases", 1),
+                    )
             else:
-                logger.info(
-                    "FATAL:  Mix of three-phase and single-phase not currently supported."
-                )
-                return (
-                    self.config["config"].get("defaultVoltage", 240),
-                    self.config["config"].get("numberOfPhases", 1),
-                )
-        else:
-            # Single-phase system
-            total = sum([slave.voltsPhaseA for slave in slavesWithVoltage])
-            phases = 1
+                phases = localPhases
+
+        total = sum(
+            [
+                (slave.voltsPhaseA + slave.voltsPhaseB + slave.voltsPhaseC)
+                for slave in slavesWithVoltage
+            ]
+        )
 
         return (total / (phases * len(slavesWithVoltage)), phases)
 
@@ -761,6 +804,12 @@ class TWCMaster:
         carapi.setCarApiRefreshToken(self.settings.get("carApiRefreshToken", ""))
         carapi.setCarApiTokenExpireTime(self.settings.get("carApiTokenExpireTime", ""))
 
+        # We start with vehicles, but this should be templated in future for all modules to both remove the above logic,
+        # and to push settings logic out to the individual modules
+        mods = self.getModulesByType("Vehicle")
+        for mod in mods:
+            mod["ref"].updateSettings()
+
         # If particular details are missing from the Settings dict, create them
         if not self.settings.get("VehicleGroups", None):
             self.settings["VehicleGroups"] = {}
@@ -776,6 +825,11 @@ class TWCMaster:
                 "Built-in": 1,
                 "Members": [],
             }
+        # Fill in old defaults as bridge
+        if not self.settings.get("sunrise", None):
+            self.settings["sunrise"] = 6
+        if not self.settings.get("sunset", None):
+            self.settings["sunset"] = 20
 
     def master_id_conflict(self):
         # We're playing fake slave, and we got a message from a master with our TWCID.
@@ -816,7 +870,6 @@ class TWCMaster:
         return slaveTWC
 
     def num_cars_charging_now(self):
-
         carsCharging = 0
         for slaveTWC in self.getSlaveTWCs():
             if slaveTWC.reportedAmpsActual >= 1.0:
@@ -875,7 +928,6 @@ class TWCMaster:
         return carsCharging
 
     def queue_background_task(self, task, delay=0):
-
         if delay > 0:
             bisect.insort(
                 self.backgroundTasksDelayed,
@@ -1031,17 +1083,24 @@ class TWCMaster:
         # Removes a module from the modules dict
         # This ensures we do not continue to call the module if it is
         # inoperable
+        deleted = False
         self.releasedModules.append(module)
         if self.modules.get(module, None):
             del self.modules[module]
+            deleted = True
 
+        # Remove from python sys.modules as well
         fullname = path + "." + module
         if modules.get(fullname, None):
             del modules[fullname]
+            deleted = True
 
-        logger.log(
-            logging.INFO7, "Released module %s", module, extra={"colored": "red"}
-        )
+        if deleted:
+            logger.log(
+                logging.INFO7, "Released module %s", module, extra={"colored": "red"}
+            )
+        else:
+            logger.warning("Tried to released module %s that was not loaded", module)
 
     def removeNormalChargeLimit(self, ID):
         if "chargeLimits" in self.settings and str(ID) in self.settings["chargeLimits"]:
@@ -1112,7 +1171,6 @@ class TWCMaster:
             self.lastSaveFailed = 1
 
     def send_master_linkready1(self):
-
         logger.log(logging.INFO8, "Send master linkready1")
 
         # When master is powered on or reset, it sends 5 to 7 copies of this
@@ -1162,14 +1220,13 @@ class TWCMaster:
         # linkready1/2 and if a master sees slave linkready, it will start sending
         # the slave master heartbeat once per second and the two are then connected.
         self.getInterfaceModule().send(
-            bytearray(b"\xFC\xE1")
+            bytearray(b"\xfc\xe1")
             + self.TWCID
             + self.masterSign
             + bytearray(b"\x00\x00\x00\x00\x00\x00\x00\x00")
         )
 
     def send_master_linkready2(self):
-
         logger.log(logging.INFO8, "Send master linkready2")
 
         # This linkready2 message is also sent 5 times when master is booted/reset
@@ -1189,7 +1246,7 @@ class TWCMaster:
         # no longer sends the global linkready2 message (or if it does,
         # they're quite rare so I haven't seen them).
         self.getInterfaceModule().send(
-            bytearray(b"\xFB\xE2")
+            bytearray(b"\xfb\xe2")
             + self.TWCID
             + self.masterSign
             + bytearray(b"\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -1205,10 +1262,10 @@ class TWCMaster:
         # LED on. Manual says this means "The networked Wall Connectors have
         # different maximum current capabilities".
         msg = (
-            bytearray(b"\xFD\xE2")
+            bytearray(b"\xfd\xe2")
             + self.TWCID
             + self.slaveSign
-            + bytearray(b"\x1F\x40\x00\x00\x00\x00\x00\x00")
+            + bytearray(b"\x1f\x40\x00\x00\x00\x00\x00\x00")
         )
         if self.protocolVersion == 2:
             msg += bytearray(b"\x00\x00")
@@ -1219,7 +1276,7 @@ class TWCMaster:
         # This function will loop through each of the Slave TWCs, and send them the start command.
         for slaveTWC in self.getSlaveTWCs():
             self.getInterfaceModule().send(
-                bytearray(b"\xFC\xB1")
+                bytearray(b"\xfc\xb1")
                 + self.TWCID
                 + slaveTWC.TWCID
                 + bytearray(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -1231,7 +1288,7 @@ class TWCMaster:
         for slaveTWC in self.getSlaveTWCs():
             if (not subTWC) or (subTWC == slaveTWC.TWCID):
                 self.getInterfaceModule().send(
-                    bytearray(b"\xFC\xB2")
+                    bytearray(b"\xfc\xb2")
                     + self.TWCID
                     + slaveTWC.TWCID
                     + bytearray(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -1261,6 +1318,9 @@ class TWCMaster:
         # average across sources perhaps, or do a primary/secondary priority
         self.consumptionValues[source] = value
 
+    def setConsumptionAmps(self, source, value):
+        self.consumptionAmpsValues[source] = value
+
     def setGeneration(self, source, value):
         self.generationValues[source] = value
 
@@ -1282,8 +1342,22 @@ class TWCMaster:
         # master's TWCID
         self.masterTWCID = twcid
 
-    def setMaxAmpsToDivideAmongSlaves(self, amps):
+    def setLimitAmpsToDivideAmongSlaves(self, amps):
+        # Use backgroundTasksLock to prevent changing limitAmpsToDivideAmongSlaves
+        # if the main thread is in the middle of examining and later using
+        # that value.
+        self.getBackgroundTasksLock()
 
+        if amps > self.config["config"]["wiringMaxAmpsAllTWCs"]:
+            # Never tell the slaves
+            # to draw more amps than the physical charger wiring can handle.
+            amps = self.config["config"]["wiringMaxAmpsAllTWCs"]
+
+        self.limitAmpsToDivideAmongSlaves = amps
+
+        self.releaseBackgroundTasksLock()
+
+    def setMaxAmpsToDivideAmongSlaves(self, amps):
         # Use backgroundTasksLock to prevent changing maxAmpsToDivideAmongSlaves
         # if the main thread is in the middle of examining and later using
         # that value.
@@ -1292,7 +1366,7 @@ class TWCMaster:
         if amps > self.config["config"]["wiringMaxAmpsAllTWCs"]:
             # Never tell the slaves to draw more amps than the physical charger
             # wiring can handle.
-            logger.info(
+            logger.error(
                 "ERROR: specified maxAmpsToDivideAmongSlaves "
                 + str(amps)
                 + " > wiringMaxAmpsAllTWCs "
@@ -1507,6 +1581,6 @@ class TWCMaster:
         num <<= 1
         if bit:
             num |= 1
-        num &= 2 ** bits - 1
+        num &= 2**bits - 1
 
         return num

@@ -1,18 +1,19 @@
-from ww import f
 from datetime import datetime
 import logging
 import re
 import time
 
 
-logger = logging.getLogger("\u26FD Slave")
+logger = logging.getLogger("\u26fd Slave")
 
 
 class TWCSlave:
-
     config = None
     configConfig = None
     TWCID = None
+    __lastAPIAmpsValue = 0
+    __lastAPIAmpsRequest = time.time() + 30
+    __lastAPIAmpsRepeat = 0
     lastVINQuery = 0
     maxAmps = None
     master = None
@@ -75,6 +76,7 @@ class TWCSlave:
         self.master = master
         self.TWCID = TWCID
         self.maxAmps = maxAmps
+        self.APIcontrol = False
 
         self.wiringMaxAmps = self.configConfig.get("wiringMaxAmpsPerTWC", 6)
         self.useFlexAmpsToStartCharge = self.configConfig.get(
@@ -83,7 +85,6 @@ class TWCSlave:
         self.startStopDelay = self.configConfig.get("startStopDelay", 60)
 
     def print_status(self, heartbeatData):
-
         try:
             debugOutput = "SHB %02X%02X: %02X %05.2f/%05.2fA %02X%02X" % (
                 self.TWCID[0],
@@ -321,7 +322,7 @@ class TWCSlave:
                 self.master.slaveHeartbeatData.append(0x00)
 
         self.master.getModulesByType("Interface")[0]["ref"].send(
-            bytearray(b"\xFD\xE0")
+            bytearray(b"\xfd\xe0")
             + self.master.getFakeTWCID()
             + bytearray(masterID)
             + bytearray(self.master.slaveHeartbeatData)
@@ -365,10 +366,10 @@ class TWCSlave:
         #                   Manual says this code means 'The networked Wall
         #                   Connectors have different maximum current
         #                   capabilities.'
-        #   	0000 1000 = No effect
-        #   	0001 0000 = No effect
-        #   	0010 0000 = No effect
-        #   	0100 0000 = No effect
+        #       0000 1000 = No effect
+        #       0001 0000 = No effect
+        #       0010 0000 = No effect
+        #       0100 0000 = No effect
         #       1000 0000 = No effect
         #     When two bits are set, the lowest bit (rightmost bit) seems to
         #     take precedence (ie 111 results in 3 blinks, 110 results in 5
@@ -536,29 +537,15 @@ class TWCSlave:
                     self.master.stopCarsCharging()
             elif (
                 self.lastAmpsOffered >= self.config["config"]["minAmpsPerTWC"]
-                and self.reportedAmpsActual < 2.0
+                and self.reportedAmpsActual < 1.0
                 and self.reportedState != 0x02
             ):
                 # Car is not charging and is not reporting an error state, so
                 # try starting charge via car api.
                 self.master.startCarsCharging()
-            elif self.reportedAmpsActual > 4.0:
-                # At least one plugged in car is successfully charging. We don't
-                # know which car it is, so we must set
-                # vehicle.stopAskingToStartCharging = False on all vehicles such
-                # that if any vehicle is not charging without us calling
-                # car_api_charge(False), we'll try to start it charging again at
-                # least once. This probably isn't necessary but might prevent
-                # some unexpected case from never starting a charge. It also
-                # seems less confusing to see in the output that we always try
-                # to start API charging after the car stops taking a charge.
-                for vehicle in self.master.getModuleByName(
-                    "TeslaAPI"
-                ).getCarApiVehicles():
-                    vehicle.stopAskingToStartCharging = False
 
         self.master.getModulesByType("Interface")[0]["ref"].send(
-            bytearray(b"\xFB\xE0")
+            bytearray(b"\xfb\xe0")
             + self.master.getFakeTWCID()
             + bytearray(self.TWCID)
             + bytearray(self.masterHeartbeatData)
@@ -575,6 +562,16 @@ class TWCSlave:
         self.reportedAmpsMax = ((heartbeatData[1] << 8) + heartbeatData[2]) / 100
         self.reportedAmpsActual = ((heartbeatData[3] << 8) + heartbeatData[4]) / 100
         self.reportedState = heartbeatData[0]
+
+        if self.reportedState == 0x02:
+            logger.info(
+                "WARNING: slave TWC %02X%02X is sending error with status data: %s"
+                % (
+                    self.TWCID[0],
+                    self.TWCID[1],
+                    self.master.hex_str(heartbeatData),
+                )
+            )
 
         if self.reportedAmpsActual != self.reportedAmpsLast:
             self.reportedAmpsLast = self.reportedAmpsActual
@@ -624,6 +621,15 @@ class TWCSlave:
             self.master.queue_background_task({"cmd": "checkDeparture"}, 20 * 60)
             self.master.queue_background_task({"cmd": "checkDeparture"}, 45 * 60)
 
+            # If the drop-off was an expected completion, don't restart
+            lastVehicle = self.getLastVehicle()
+            if (
+                lastVehicle is not None
+                and lastVehicle.chargingState is "Charging"
+                and lastVehicle.timeToFullCharge * 60 <= 5
+            ):
+                lastVehicle.stopAskingToStartCharging = True
+
         # Keep track of the amps the slave is actually using and the last time it
         # changed by more than 0.8A.
         # Also update self.reportedAmpsActualSignificantChangeMonitor if it's
@@ -658,6 +664,12 @@ class TWCSlave:
         numCarsCharging = self.master.num_cars_charging_now()
         desiredAmpsOffered = self.master.getMaxAmpsToDivideAmongSlaves()
         flex = self.master.getAllowedFlex()
+
+        # Get charge rate control mode from settings
+        # 1 = Use TWC Exclusively to control Charge Rate
+        # 2 = Use Tesla API Exclusively to control Charge Rate
+        # 3 = Use TWC >= 6A + Tesla API < 6A to control Charge Rate
+        chargeRateControl = int(self.master.settings.get("chargeRateControl", 1))
 
         if numCarsCharging > 0:
             desiredAmpsOffered -= sum(
@@ -748,7 +760,9 @@ class TWCSlave:
                         + str(self.minAmpsTWCSupports)
                         + " (self.minAmpsTWCSupports)"
                     )
+
                     desiredAmpsOffered = self.minAmpsTWCSupports
+
                 else:
                     # There is not enough power available to give each car
                     # minAmpsToOffer, so don't offer power to any cars. Alternately,
@@ -797,7 +811,61 @@ class TWCSlave:
                 # so we need to set desiredAmpsOffered to 0
                 logger.debug("no cars charging, setting desiredAmpsOffered to 0")
                 desiredAmpsOffered = 0
+        elif chargeRateControl == 2 or (
+            chargeRateControl == 3 and desiredAmpsOffered < 6
+        ):
+            # Control is given to the Tesla API to control Charge Rate
+            # We offer the maximum wiring amps from the TWC, and ask the API to control charge rate
+            self.APIcontrol = True
+
+            # Call the Tesla API to set the charge rate for vehicle connected to this TWC
+            # TODO: Identify vehicle
+            if (
+                int(desiredAmpsOffered) == self.__lastAPIAmpsValue
+                and (
+                    self.__lastAPIAmpsRepeat > 50 or self.__lastAPIAmpsRepeat % 10 != 0
+                )
+            ) or self.__lastAPIAmpsRequest > time.time() - 15:
+                # Unfortunately some API requests just don't result in the desired amperage being set, so we allow one in 10
+                # to be repeated up to 50, as long as none had been sent in the last 15 seconds
+                # This results in a small number of repeat requests sent to the API each time
+                # we change the target charge rate, but adds stability to the process
+                self.__lastAPIAmpsRepeat += 1
+            else:
+                self.__lastAPIAmpsRequest = time.time()
+                self.__lastAPIAmpsRepeat = 0
+                self.__lastAPIAmpsValue = int(desiredAmpsOffered)
+
+                # Determine vehicle to control
+                targetVehicle = (
+                    None if self.getLastVehicle() is None else self.getLastVehicle()
+                )
+
+                if not self.master.getModuleByName(
+                    "TeslaBLE"
+                ) or not self.master.getModuleByName("TeslaBLE").setChargeRate(
+                    int(desiredAmpsOffered), targetVehicle
+                ):
+                    self.master.getModuleByName("TeslaAPI").setChargeRate(
+                        int(desiredAmpsOffered), targetVehicle
+                    )
+
+            desiredAmpsOffered = self.wiringMaxAmps
+
         else:
+            # If we just switched from API to TWC make sure the car is set to a
+            # high enough charge rate so it is not limiting the TWC control
+            if chargeRateControl == 3 and self.APIcontrol:
+                if not self.master.getModuleByName(
+                    "TeslaBLE"
+                ) or not self.master.getModuleByName("TeslaBLE").setChargeRate(
+                    self.wiringMaxAmps, self.getLastVehicle()
+                ):
+                    self.master.getModuleByName("TeslaAPI").setChargeRate(
+                        self.wiringMaxAmps, self.getLastVehicle()
+                    )
+                self.APIcontrol = False
+
             # We can tell the TWC how much power to use in 0.01A increments, but
             # the car will only alter its power in larger increments (somewhere
             # between 0.5 and 0.6A). The car seems to prefer being sent whole
@@ -934,8 +1002,12 @@ class TWCSlave:
                 if now - self.timeLastAmpsOfferedChanged < 5:
                     desiredAmpsOffered = self.lastAmpsOffered
 
-        if (self.lastAmpsDesired <= 0 and desiredAmpsOffered > 0) or (
-            self.lastAmpsDesired > 0 and desiredAmpsOffered == 0
+        if (
+            self.lastAmpsDesired < minAmpsToOffer
+            and desiredAmpsOffered >= minAmpsToOffer
+        ) or (
+            self.lastAmpsDesired >= minAmpsToOffer
+            and desiredAmpsOffered < minAmpsToOffer
         ):
             self.lastAmpsDesired = desiredAmpsOffered
             self.timeLastAmpsDesiredFlipped = now

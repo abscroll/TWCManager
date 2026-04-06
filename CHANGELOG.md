@@ -2,19 +2,109 @@
 
 This document logs the changes per release of TWCManager.
 
-## v1.3.0 - Latest Development Version
+## v1.4.0 - Upcoming Development release
+* Placeholder - TWC abstraction code
+* (@ngardiner) - Initial commit of local Tesla BLE vehicle control module
+* (@MikeBishop) - Fall-back to VIN as vehicle name if API does not specify a name
+* (@MikeBishop) - MQTT Improvements
+* (@MikeBishop) - Dampen API calls to reduce unnecessary calls
+* (@RichieB2B) - Allow limiting of maximum grid power import, introduce getConsumptionAmps for EMS modules
+* (@RichieB2B) - Add Fleet Telemetry MQTT support
+* (@ngardiner) - Add support for decrypting TeslaMate API credentials using the encryption key
+* Bugfixes
+    * (@MikeBishop) - Explicitly request drive_state data to fix apparent issue with older models, and remove endpoints that are not used
+    * (@dtiefnig) - Specify access scope for token refresh
+    * (@evheros) - Fix typo in log levels
+    * (@RichieB2B / @evheros) - Fix incorrect return variable name in BLE Peering code
+    * (@dehsgr) - Fix Makefile issues (alternate HOME support and BLE permissions)
 
-## v1.2.4 - 2021-08-31
+## v1.3.2 - 2023-03-12
+* (@RichieB2B) - Nicer looking log prefixes for EMS modules
+* (@RichieB2B) - Support for new fleet API and vehicle command proxy
+* (@RichieB2B) - Upgrade MQTT support for paho v2/MQTTv5
+* (@RichieB2B) - Enable reporting of Slave error messages
+* (@RichieB2B) - Reset stopAskingToStartCharging more often
+* Bugfixes
+    * (@RichieB2B) - Fix issues with mysql status logging statements
+    * (@ngardiner) - Fix issues preventing web UI display when internet access is unavailable
 
+## v1.3.1 - 2023-11-19
+* (@RichieB2B) - Support for new fleet API endpoint for location telemetry
+* (@RichieB2B) - More accurate getConsumptionAmps for DSMRreader (esp. for unbalanced 3-phase circuits)
+* Bugfixes
+     * (@ngardiner) - Avoid web interface crash when ampsList cannot be derived from minAmpsPerTWC and wiringMaxAmpsPerTWC (root cause under investigation)
+     * (@ngardiner) - Fix issue with dependency versions
+
+## v1.3.0 - 2023-05-28
+
+* Bugfixes
+     * (@dtiefnig) - Fix issue with logic around detecting instances of multi-phase system incompatibility
+     * (@dtiefnig) - Fix issue with zero-byte VINs causing infinite VIN fetch retries
+     * (@MikeBishop) - Fix rounding in calculation of current offer when calculating delta to new offer to improve accuracy
+     * (@ngardiner) - Adjust voltage / phase detection to handle combinations of 1/2/3 phase systems, as long as all slave TWCs have the same number of active phases
+     * (@ccutrer) - Fix openhab integration to properly parse floats
+     * (@ngardiner) - Detect issues with serial connection (RS485) and automatically reconnect
+     * (@RichieB2B) - Fix MQTT EMS module (missing brokerPort)
+     * (@RichieB2B) - Fix large steps in ChargeNow duration in the web interface
+     * (@mattiasclaesson) - Remove unnecessary kWh suffix from web UI
+
+* Features
+
+    * (@hopfi2k) - Major "Modern Theme" update. Switched to Bootstrap 5.02, bug fixes, now fully responsive
+    * (@ngardiner) - Add Home Location view and modification controls to settings page
+    * (@ngardiner) - Add MQTT EMS module (currently pre-release for testing)
+    * (@dtiefnig) - Add switch to output plain text Console output (turn off color)
+    * (@dtiefnig) - Unify single and multi-car charge at home behaviour
+    * (@dtiefnig) - Add Modbus TCP support for SolarEdge EMS module
+    * (@dtiefnig / @MikeBishop) - Update Tesla API charging states
+    * (@dtiefnig) - Reference entrypoint script from within Docker container to remove dependency on external source tree
+    * (@ngardiner) - Add Current Policy as status value (to be published to HASS / MQTT)
+    * (@MikeBishop) - Fix API interactions impacted by Tesla's vehicle_data endpoint changes
+    * (@MikeBishop) - Implement improved VIN Check routine
+    * (@RichieB2B) - Add option to leverage Tesla API for lower amp control, otherwise leverage TWC
+    * (@RichieB2B) - Add DSM Reader EMS Module
+    * (@cods4) - Update to documentation 
+
+## v1.2.6 - 2022-02-28
+
+  * Bugfixes:
+     * (@ngardiner) - Fix for exception regarding serialization of bytes object in JSON data for Tesla Auth Flow
+  * (@ngardiner) - First revision of self-update mechanism for TWCManager - will be activated once v1.3.0 is released
+
+## v1.2.5 - 2022-02-27
+
+  * Bugfixes:
+     * (@ngardiner) - Fix debug settings form issues
+     * (@ngardiner) - Fix token refresh timing for manually entered tokens
+  * (@ngardiner) - Add support for multiple Fronius inverters
+  * (@MikeBishop) - Add support for detecting sunrise and sunset times based on home location using sunrise-sunset.org API
+  * (@ngardiner) - Replace Tesla Login flow with one that is workable with the latest (millionth?) iteration of Tesla API auth flow
+  * (@MikeBishop) - Add configuration parameter to always perform Green Energy checking, including outside of daylight hours (maintaining current default of off for now)
+
+## v1.2.4 - 2022-02-15
+
+  * **Breaking Changes**
+      * Due to changes introduced by Python 3.9, the minimum version of Python supported from v1.2.4 forward is **Python 3.6**
+          * This means that v1.2.3 is the end of the line for Debian Stretch based machines - upgrade to buster to use v1.2.4 and above.
+      * The configuration parsing engine has been changed to PyYAML
+          * This may cause your config file to stop parsing correctly. If so, my apologies, however it does allow us to support both JSON and YAML formats going forward.
   * Bugfixes:
       * (@MikeBishop) - Fix debounce mechanism to avoid continuous charging when minimum generation is not met in some circumstances
       * (@ngardiner) - Align web interface TWCID so that it is lowercase, avoiding issues with JavaScript and Jinja2 misalignment
-      * (@ngardiner) - Change cryptography module dependency to avoid versions requiring rust compiler
+      * (@ngardiner) - Change cryptography module dependency to avoid versions requiring rust compiler (no module named setuptools_rust error)
       * (@ngardiner) - Add logic to set token expiry time when manually adding tokens
+      * (@blach) - Fix Tesla API token refresh logic
  * (@MikeBishop) - Change to Powerwall Auth handling to expire auth tokens earlier due to changes in Powerwall auth handling
  * (@ngardiner) - Add version check to Web UI
  * (@ngardiner) - Add handling of recaptcha challenge (with DNS workaround), and provide other options if this is not possible
  * (@ngardiner) - Add Tesla API debug interface to allow sending Tesla API commands
+ * (@ngardiner) - Added TeslaMate sync functionality to allow sync of telemetry and API token details
+ * (@ngardiner) - In line with changes made by setuptools team to deprecate setup.py as command line tool, switched to native python build tools
+ * (@MikeBishop) - Restrict dampening to green policies only, and prefer to keep charging vs stop/start
+ * (@ngardiner) - Reduce potential Tesla API backoff time
+ * (@deece) - Addition of Open Energy Monitor EMS module
+ * (@dehsgr) - Addition of URL EMS module
+ * (@tjikkun) - Set HASS sensor state class to make it work with statistics dashboard
 
 ## v1.2.3 - 2021-08-10
 
