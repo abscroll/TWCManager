@@ -2,8 +2,9 @@
 import logging
 import time
 import solaredge_modbus
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U000026c5 SolarEdg")
+logger = LoggerFactory.get_logger("SolarEdg", "EMS")
 
 
 class SolarEdge:
@@ -45,7 +46,7 @@ class SolarEdge:
         except KeyError:
             self.configConfig = {}
         try:
-            self.configSolarEdge = master.config["sources"]["SolarEdge"]
+            self.configSolarEdge = master.config.get("sources", {})["SolarEdge"]
         except KeyError:
             self.configSolarEdge = {}
         self.apiKey = self.configSolarEdge.get("apiKey", None)

@@ -3,34 +3,136 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
+import json
 import logging
 import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
-from threading import Timer
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U0001f697 TeslaBLE")
+logger = LoggerFactory.get_logger("TeslaBLE", "Vehicle")
+
+
+class BLECircuitBreaker:
+    """Circuit breaker pattern to prevent thrashing on persistent failures."""
+
+    def __init__(self, failure_threshold=5, recovery_timeout=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = {}  # {vin: count}
+        self.failure_times = {}  # {vin: timestamp}
+
+    def record_failure(self, vin):
+        """Record a failure for a vehicle."""
+        now = time.time()
+        self.failures[vin] = self.failures.get(vin, 0) + 1
+        self.failure_times[vin] = now
+
+    def record_success(self, vin):
+        """Record a success for a vehicle, reset failure count."""
+        self.failures[vin] = 0
+
+    def is_open(self, vin):
+        """Check if circuit is open (stop retrying for this vehicle)."""
+        if vin not in self.failures:
+            return False
+
+        if self.failures[vin] < self.failure_threshold:
+            return False
+
+        # Check if recovery timeout has passed
+        now = time.time()
+        time_since_failure = now - self.failure_times.get(vin, now)
+
+        if time_since_failure > self.recovery_timeout:
+            # Try again (half-open state)
+            return False
+
+        return True
+
+    def get_status(self, vin):
+        """Get circuit breaker status for a vehicle."""
+        if vin not in self.failures:
+            return "closed"  # Normal operation
+
+        if self.is_open(vin):
+            return "open"  # Stop retrying
+
+        return "half-open"  # Trying to recover
 
 
 class TeslaBLE:
     binaryPath = None
-    commandTimeout = 10
+    commandTimeout = 5
     config = None
     configConfig = None
     isDockerCached = None
     master = None
     pipe = None
+    enabled = True
     pipeName = "/tmp/ble_data"
+    pipeOpen = False  # Track pipe state
 
     def __init__(self, master):
         self.master = master
         try:
             self.config = self.master.config
         except KeyError:
-            pass
+            self.config = {}
         self.configConfig = self.config.get("config", {})
+        cfg = self.config.get("vehicle", {}).get("teslaBLE", {}) or {}
+        self._enabled = cfg.get("enabled", True)
+
+        # Load BLE-specific configuration with enhanced defaults
+        ble_config = self.configConfig.get("moduleConfiguration", {}).get(
+            "TeslaBLE", {}
+        )
+
+        # Enhanced configuration parameters
+        self.commandTimeout = ble_config.get("commandTimeout", 5)
+        self.maxRetries = ble_config.get("maxRetries", 3)
+        self.retryDelay = ble_config.get("retryDelay", 2)
+        self.processGroupManagement = ble_config.get("processGroupManagement", True)
+        self.dockerCompatibility = ble_config.get("dockerCompatibility", True)
+        self.statsReporting = ble_config.get("statsReporting", True)
+
+        # Circuit breaker configuration
+        circuit_breaker_threshold = ble_config.get("circuitBreakerThreshold", 5)
+        circuit_breaker_timeout = ble_config.get("circuitBreakerTimeout", 60)
+        self.circuit_breaker = BLECircuitBreaker(
+            circuit_breaker_threshold, circuit_breaker_timeout
+        )
+
+        # Retry statistics tracking
+        self.retry_stats = {}
+
+        # Per-VIN flag: True once we've successfully applied a charge limit.
+        # Prevents re-sending on every poll cycle.
+        self._stopTryingToApplyLimit = {}
+        # Track the last-applied limit per VIN to allow changing limits
+        self._lastAppliedChargeLimit = {}
+        # Per-VIN flag: True once car confirmed already in desired charge state
+        self._stopAskingToStartCharging = {}
+
+        # Persistent D-Bus session daemon shared across all tesla-control calls.
+        # dbus-launch only spawns a new daemon when DBUS_SESSION_BUS_ADDRESS is
+        # absent from the environment. By starting one daemon here and passing its
+        # address to every subprocess, we prevent tesla-control's internal
+        # dbus-launch from spawning a new daemon on each invocation.
+        self._dbus_session_address = None
+        self._dbus_session_pid = None
+        self._start_dbus_session()
+
+        logger.info(
+            f"BLE module initialized with timeout={self.commandTimeout}s, retries={self.maxRetries}, "
+            f"circuit_breaker_threshold={circuit_breaker_threshold}"
+        )
+
+        # Clean up any stale pipe file from previous crashes
+        self._cleanup_stale_pipe()
 
         # Determine best binary location
         self.binaryPath = self.configConfig.get(
@@ -41,142 +143,688 @@ class TeslaBLE:
         if not self.binaryPath or not os.path.isfile(self.binaryPath):
             self.binaryPath = shutil.which("tesla-control")
 
-        # Final fallback prior to failure
+        # Check that binary exists and is executable, otherwise unload
         if not self.binaryPath or not os.path.isfile(self.binaryPath):
-            self.binaryPath = "/home/twcmanager/gobin/tesla-control"
-
-        # Check that binary exists, otherwise unload
-        if not self.binaryPath or not os.path.isfile(self.binaryPath):
-            logger.log(
-                logging.INFO3,
-                "Unable to find tesla-control binary in any of the expected locations. Unloading module.",
+            logger.error(
+                "tesla-control binary not found - BLE module will be disabled. "
+                "Set vehicle.teslaBLE.enabled=false in config to suppress this module."
             )
             self.master.releaseModule("lib.TWCManager.Vehicle", "TeslaBLE")
             return
-
-    def car_api_charge(self, charge):
-        # This is not very well thought out at all - we'll just loop through
-        # and ask all cars to charge for now
-
-        vehicles = self.master.settings.get("Vehicles")
-        if not vehicles:
-            logger.info(
-                "No Vehicles configuration found. TeslaBLE cannot control charging without vehicle configuration."
+        elif not os.access(self.binaryPath, os.X_OK):
+            logger.error(
+                f"tesla-control binary at {self.binaryPath} is not executable - "
+                "BLE module will be disabled. Check file permissions or set "
+                "vehicle.teslaBLE.enabled=false in config to suppress this module."
             )
+            self.master.releaseModule("lib.TWCManager.Vehicle", "TeslaBLE")
+            return
+        else:
+            logger.info(f"tesla-control binary found at: {self.binaryPath}")
+
+    def _scheduleBlocksStart(self, vin):
+        # Don't override the car's own Scheduled Charging / Departure timer
+        # with a BLE start command (see TeslaAPI.car_api_charge for the
+        # API-side equivalent). Schedule state comes from the TeslaAPI module;
+        # without it (BLE-only installs) we have no schedule data and allow
+        # the command.
+        if not self.master.config["config"].get("respectVehicleSchedule", True):
+            return False
+        teslaapi = self.master.getModuleByName("TeslaAPI")
+        if not teslaapi:
+            return False
+        try:
+            return teslaapi.vehicleScheduledChargingPending(vin)
+        except Exception:
             return False
 
-        for vehicle in vehicles.keys():
-            if charge:
-                self.startCharging(vehicle)
-                return self.pingVehicle(vehicle)
+    def car_api_charge(self, task):
+        """
+        Enhanced car_api_charge method with proper priority system integration.
+        Returns True on success, False on failure to enable proper fallback.
+
+        Args:
+            task: Dictionary with 'charge' key (True/False) and optional 'vin' key
+        """
+        try:
+            # Validate input task
+            if not task:
+                logger.error("car_api_charge called with empty task")
+                return False
+
+            if not isinstance(task, dict):
+                logger.error(f"car_api_charge expects dict, got {type(task)}")
+                return False
+
+            # Extract charge parameter
+            charge = task.get("charge", None)
+            if charge is None:
+                logger.error("Task missing required 'charge' key")
+                return False
+
+            # When stopping, reset per-VIN "stop asking" flags so the next
+            # start cycle starts fresh (mirrors TeslaAPI.car_api_charge).
+            if not charge:
+                self._stopAskingToStartCharging.clear()
+
+            # If we know the VIN of the vehicle connected to the TWC Slave, we'll send the command
+            # directly to that vehicle
+            vin = task.get("vin", None)
+            if vin:
+                logger.debug(f"BLE command for specific VIN: {vin}, charge: {charge}")
+
+                if charge:
+                    if self._stopAskingToStartCharging.get(vin):
+                        logger.debug(
+                            "BLE: not re-requesting charge start for %s: already in desired state"
+                            % vin
+                        )
+                        return True
+                    if self._scheduleBlocksStart(vin):
+                        logger.info(
+                            f"{vin} is waiting on its in-car charging schedule; not sending BLE start"
+                        )
+                        return True
+                    success = self.startCharging(vin)
+                    logger.info(
+                        f"BLE start charging for {vin}: {'success' if success else 'failed'}"
+                    )
+                    return success
+                else:
+                    success = self.stopCharging(vin)
+                    logger.info(
+                        f"BLE stop charging for {vin}: {'success' if success else 'failed'}"
+                    )
+                    return success
             else:
-                self.stopCharging(vehicle)
-                return self.pingVehicle(vehicle)
+                # If we don't know the VIN, we send to all vehicles
+                # This is not optimal for multi-vehicle installs, but may be necessary when TWC doesn't read VIN
+                logger.debug(f"BLE command for all vehicles, charge: {charge}")
+
+                if not self.master.settings.get("Vehicles"):
+                    logger.error("No vehicles configured for BLE operation")
+                    return False
+
+                success_count = 0
+                attempted_count = 0
+                skipped_count = 0
+                total_vehicles = len(self.master.settings["Vehicles"])
+
+                for vehicle in self.master.settings["Vehicles"].keys():
+                    try:
+                        if charge:
+                            if self._stopAskingToStartCharging.get(vehicle):
+                                logger.debug(
+                                    "BLE: not re-requesting charge start for %s: already in desired state"
+                                    % vehicle
+                                )
+                                skipped_count += 1
+                                continue
+                            if self._scheduleBlocksStart(vehicle):
+                                logger.info(
+                                    f"{vehicle} is waiting on its in-car charging schedule; not sending BLE start"
+                                )
+                                skipped_count += 1
+                                continue
+                            attempted_count += 1
+                            vehicle_success = self.startCharging(vehicle)
+                        else:
+                            attempted_count += 1
+                            vehicle_success = self.stopCharging(vehicle)
+
+                        if vehicle_success:
+                            success_count += 1
+                            logger.debug(
+                                f"BLE command successful for vehicle {vehicle}"
+                            )
+                        else:
+                            logger.warning(f"BLE command failed for vehicle {vehicle}")
+
+                    except Exception as e:
+                        logger.error(
+                            f"BLE command exception for vehicle {vehicle}: {e}"
+                        )
+                        continue
+
+                # Consider operation successful if any commands succeeded, or if all
+                # vehicles were skipped (already in desired state, schedule blocking, etc.).
+                # Skipped vehicles = successfully handled by deciding not to re-send.
+                if attempted_count > 0:
+                    # Commands were attempted; succeed only if at least one succeeded
+                    overall_success = success_count > 0
+                    logger.info(
+                        f"BLE command result: {success_count}/{attempted_count} attempted vehicles succeeded"
+                        + (f", {skipped_count} skipped" if skipped_count > 0 else "")
+                    )
+                else:
+                    # All vehicles skipped; that's a successful handling
+                    overall_success = True
+
+                return overall_success
+
+        except Exception as e:
+            logger.error(f"BLE car_api_charge failed with exception: {e}")
+            return False
+
+    def _is_already_satisfied(self, output):
+        """Return True if output indicates the car is already in the desired charge state."""
+        if not output:
+            return False
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="ignore")
+        output_lower = output.lower()
+        return any(
+            ("car could not execute command: " + reason) in output_lower
+            for reason in (
+                "complete",
+                "is_charging",
+                "charging",
+                "requested",
+                "disconnected",
+                "already_set",
+            )
+        )
 
     def parseCommandOutput(self, output):
-        success = False
-        if "Updated session info for DOMAIN_VEHICLE_SECURITY" in output:
-            success = True
-
-        return success
-
-    def peerWithVehicle(self, vin):
-        self.sendPublicKey(vin)
-        command_string = [
-            self.binaryPath,
-            "-debug",
-            "-ble",
-            "-vin",
-            vin,
-            "add-key-request",
-            self.pipeName,
-            "owner",
-            "cloud_key",
-        ]
-
-        if self.isDocker():
-            command_string.insert(0, "nsenter --net=/rootns/net ")
-
-        result = subprocess.run(
-            command_string,
-            stdout=subprocess.PIPE,
-        )
-        self.closeFile()
-        return self.parseCommandOutput(result)
-
-    def pingVehicle(self, vin):
-        ret = self.sendCommand(vin, "ping")
-        return self.parseCommandOutput(ret)
-
-    def sendCommand(self, vin, command, args=None):
-        self.sendPrivateKey(vin)
-        command_string = [
-            self.binaryPath,
-            "-debug",
-            "-ble",
-            "-vin",
-            vin,
-            "-key-file",
-            self.pipeName,
-            command,
-        ]
-        if self.isDocker():
-            command_string.insert(0, "nsenter --net=/rootns/net ")
-
-        if args:
-            command_string.append(str(args))
-
-        result = None
-        try:
-            result = subprocess.Popen(
-                command_string,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except PermissionError:
-            logger.log(
-                logging.INFO3,
-                "Unable to execute tesla-control binary due to permissions or capabilities not being set. Unloading module.",
-            )
-            self.master.releaseModule("lib.TWCManager.Vehicle", "TeslaBLE")
-            return
-
-        if not result:
+        """
+        Enhanced command output parsing with detailed error categorization.
+        Returns True for success, False for failure.
+        """
+        if not output:
+            logger.debug("BLE command returned empty output")
             return False
 
-        timer = Timer(self.commandTimeout, result.kill)
+        # Convert to string if needed
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="ignore")
+
+        # Success indicators
+        success_indicators = [
+            "Updated session info for DOMAIN_VEHICLE_SECURITY",
+            "Command executed successfully",
+            "Vehicle responded",
+            "Success",
+            "ok",
+        ]
+
+        output_lower = output.lower()
+
+        # Check for success
+        for indicator in success_indicators:
+            if indicator.lower() in output_lower:
+                logger.debug(f"BLE command success: {indicator}")
+                return True
+
+        if self._is_already_satisfied(output):
+            logger.debug("BLE command success: already in desired state")
+            return True
+
+        # Categorize errors for detailed logging
+        error_indicators = {
+            "timeout": ["timeout", "timed out", "no response"],
+            "connection": ["connection failed", "unable to connect", "bluetooth error"],
+            "authentication": ["authentication failed", "invalid key", "unauthorized"],
+            "vehicle_unavailable": [
+                "vehicle not found",
+                "vehicle offline",
+                "not available",
+            ],
+            "command_failed": ["command failed", "error executing", "operation failed"],
+        }
+
+        error_type = "unknown"
+        for category, indicators in error_indicators.items():
+            for indicator in indicators:
+                if indicator in output_lower:
+                    error_type = category
+                    break
+            if error_type != "unknown":
+                break
+
+        logger.debug(
+            f"BLE command failed - Error type: {error_type}, Output: {output[:100]}..."
+        )
+        return False
+
+    def peerWithVehicle(self, vin):
+        """
+        Pair with a vehicle using BLE key exchange.
+        Returns True on success, False on failure.
+        """
         try:
-            timer.start()
-            stdout, stderr = result.communicate()
-        finally:
-            timer.cancel()
+            logger.info(f"Initiating BLE pairing with vehicle {vin}")
 
-        self.closeFile()
-        return stderr.decode("utf-8")
+            if (
+                not self.binaryPath
+                or not os.path.isfile(self.binaryPath)
+                or not os.access(self.binaryPath, os.X_OK)
+            ):
+                logger.error(
+                    "tesla-control binary not available or not executable for pairing"
+                )
+                return False
 
-    def setChargeRate(self, charge_rate, vehicle=None, set_again=False):
-        if vehicle:
-            ret = self.sendCommand(vehicle, "charging-set-amps", charge_rate)
-            return self.parseCommandOutput(ret)
-        else:
-            # It's possible that a TWC doesn't know the vehicle VIN
-            # This really isn't optimal but we'll limit charge rate for all known vehicles
-            # This also means we need to detect success of any one vehicle and return that
-            success = False
-            for vehicle in self.master.settings["Vehicles"].keys():
-                ret = self.sendCommand(vehicle, "charging-set-amps", charge_rate)
-                if self.parseCommandOutput(ret):
-                    success = True
+            # Send public key before pairing
+            if not self.sendPublicKey(vin):
+                logger.error(f"Failed to send public key for pairing with {vin}")
+                return False
+
+            command_string = [
+                self.binaryPath,
+                "-debug",
+                "-ble",
+                "-vin",
+                vin,
+                "add-key-request",
+                self.pipeName,
+                "owner",
+                "cloud_key",
+            ]
+
+            if self.isDocker():
+                command_string.insert(0, "nsenter --net=/rootns/net ")
+
+            # Use improved timeout handling (pairing takes longer)
+            stdout, stderr, return_code = self._run_command_with_timeout(
+                command_string,
+                timeout=30,  # Pairing can take longer
+                use_process_group=True,
+            )
+
+            if stdout is None and stderr is None:
+                logger.error(f"BLE pairing with {vin} timed out or failed")
+                return False
+
+            # Check both stdout and stderr for pairing result
+            output = (stderr.decode("utf-8") if stderr else "") + (
+                stdout.decode("utf-8") if stdout else ""
+            )
+            success = self.parseCommandOutput(output)
+
+            logger.info(f"BLE pairing with {vin}: {'success' if success else 'failed'}")
+            if not success:
+                logger.debug(f"Pairing output: {output[:200]}...")
+
             return success
 
+        except Exception as e:
+            logger.error(f"peerWithVehicle exception for {vin}: {e}")
+            return False
+        finally:
+            # Always ensure pipe is closed after pairing attempt
+            self._ensure_pipe_closed()
+
+    def sendCommand(self, vin, command, args=None):
+        """
+        Enhanced sendCommand with improved error handling and timeout management.
+        Returns command output string or None on failure.
+        """
+        # Accept either a VIN string or a vehicle object with a .VIN attribute
+        if hasattr(vin, "VIN"):
+            vin = vin.VIN
+        return self._execute_with_retry(self._sendCommand_internal, vin, command, args)
+
+    def _sendCommand_internal(self, vin, command, args=None):
+        """
+        Internal sendCommand implementation (called by retry wrapper).
+        Returns command output string or None on failure.
+        """
+        try:
+            # Validate inputs
+            if not vin or not command:
+                logger.error("sendCommand called with invalid vin or command")
+                return None
+
+            if (
+                not self.binaryPath
+                or not os.path.isfile(self.binaryPath)
+                or not os.access(self.binaryPath, os.X_OK)
+            ):
+                logger.error("tesla-control binary not available or not executable")
+                return None
+
+            # Check if vehicle exists in settings
+            if not self.master.settings.get("Vehicles", {}).get(vin):
+                logger.error(f"Vehicle {vin} not found in settings")
+                return None
+
+            logger.debug(
+                f"BLE sendCommand: {command} to {vin}"
+                + (f" with args {args}" if args else "")
+            )
+
+            # Send private key before command
+            if not self.sendPrivateKey(vin):
+                logger.warning(
+                    f"Failed to send private key for {vin}, proceeding anyway"
+                )
+
+            command_string = [
+                self.binaryPath,
+                "-debug",
+                "-ble",
+                "-vin",
+                vin,
+                "-key-file",
+                self.pipeName,
+                command,
+            ]
+            if self.isDocker():
+                command_string.insert(0, "nsenter --net=/rootns/net ")
+
+            if args:
+                command_string.append(str(args))
+
+            # Use improved timeout handling with process group management
+            stdout, stderr, return_code = self._run_command_with_timeout(
+                command_string, timeout=self.commandTimeout, use_process_group=True
+            )
+
+            if stdout is None and stderr is None:
+                logger.debug(f"BLE command '{command}' timed out or failed")
+                return None
+
+            # Check if process was killed due to timeout
+            if return_code == -9:  # SIGKILL
+                logger.warning(
+                    f"BLE command '{command}' timed out after {self.commandTimeout}s"
+                )
+                return None
+            output = stderr.decode("utf-8") if stderr else ""
+
+            if return_code != 0:
+                if self._is_already_satisfied(output):
+                    # Car rejected the command because it's already in the
+                    # desired state. That's a success, not something to
+                    # retry - retrying would just get the same rejection.
+                    logger.debug(
+                        f"BLE command '{command}' already satisfied: {output[:200]}"
+                    )
+                    return output
+
+                logger.warning(
+                    f"BLE command '{command}' failed with return code {return_code}: {output}"
+                )
+                logger.warning(f"BLE command full error output: {output}")
+                return None
+
+            logger.debug(
+                f"BLE command output: {output[:200]}..."
+                if len(output) > 200
+                else output
+            )
+            return output or "ok"
+
+        except Exception as e:
+            logger.error(f"sendCommand exception: {e}")
+            return None
+        finally:
+            # Always ensure pipe is closed after command
+            self._ensure_pipe_closed()
+
+    def setChargeRate(self, charge_rate, vehicle=None, set_again=False):
+        """
+        Set charge rate for vehicle(s) with enhanced error handling.
+        Returns True on success, False on failure.
+        """
+        try:
+            if vehicle:
+                # Set charge rate for specific vehicle
+                logger.debug(
+                    f"Setting charge rate {charge_rate}A for vehicle {vehicle}"
+                )
+
+                # Wake vehicle first - don't fail if wake fails, but log it
+                wake_result = self.wakeVehicle(vehicle)
+                if not wake_result:
+                    logger.warning(
+                        f"Wake command may have failed for {vehicle}, proceeding with charge rate"
+                    )
+
+                ret = self.sendCommand(vehicle, "charging-set-amps", charge_rate)
+                if ret is None:
+                    logger.error(
+                        f"Failed to send charging-set-amps command to {vehicle}"
+                    )
+                    return False
+
+                success = self.parseCommandOutput(ret)
+                logger.info(
+                    f"Set charge rate {charge_rate}A for {vehicle}: {'success' if success else 'failed'}"
+                )
+                return success
+            else:
+                # Set charge rate for all vehicles
+                # This isn't optimal but may be necessary when TWC doesn't know vehicle VIN
+                logger.debug(f"Setting charge rate {charge_rate}A for all vehicles")
+
+                if not self.master.settings.get("Vehicles"):
+                    logger.error("No vehicles configured for charge rate setting")
+                    return False
+
+                success_count = 0
+                total_vehicles = len(self.master.settings["Vehicles"])
+
+                for vehicle_vin in self.master.settings["Vehicles"].keys():
+                    try:
+                        # Wake vehicle first - don't fail if wake fails, but log it
+                        wake_result = self.wakeVehicle(vehicle_vin)
+                        if not wake_result:
+                            logger.debug(
+                                f"Wake command may have failed for {vehicle_vin}, proceeding with charge rate"
+                            )
+
+                        ret = self.sendCommand(
+                            vehicle_vin, "charging-set-amps", charge_rate
+                        )
+                        if ret is not None and self.parseCommandOutput(ret):
+                            success_count += 1
+                            logger.debug(
+                                f"Set charge rate successful for vehicle {vehicle_vin}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Set charge rate failed for vehicle {vehicle_vin}"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"Set charge rate exception for vehicle {vehicle_vin}: {e}"
+                        )
+                        continue
+
+                # Consider successful if at least one vehicle responded
+                overall_success = success_count > 0
+                logger.info(
+                    f"Set charge rate {charge_rate}A result: {success_count}/{total_vehicles} vehicles responded"
+                )
+                return overall_success
+
+        except Exception as e:
+            logger.error(f"setChargeRate exception: {e}")
+            return False
+
+    def applyChargeLimit(self, limit, checkArrival=False, checkDeparture=False):
+        """
+        Apply charge limit to vehicle(s) via BLE.
+        Args:
+            limit: Charge limit percentage (50-100), or -1 to restore to pre-TWCManager default
+            checkArrival: Ignored (BLE doesn't poll state)
+            checkDeparture: Ignored (BLE doesn't poll state)
+        Returns True on success, False on failure.
+        """
+        try:
+            if limit != -1 and (limit < 50 or limit > 100):
+                logger.error(
+                    f"Invalid charge limit {limit}%; must be 50-100 or -1 to restore"
+                )
+                return False
+
+            if not self.master.settings.get("Vehicles"):
+                logger.error("No vehicles configured for charge limit")
+                return False
+
+            logger.debug(
+                f"Applying charge limit {limit}{'% to all vehicles' if limit != -1 else ' (restore default) to all vehicles'}"
+            )
+
+            success_count = 0
+            attempted_count = 0
+            skipped_count = 0
+            total_vehicles = len(self.master.settings["Vehicles"])
+
+            for vehicle_vin in self.master.settings["Vehicles"].keys():
+                try:
+                    # Skip if we've already successfully applied this exact limit to this vehicle
+                    if (
+                        self._stopTryingToApplyLimit.get(vehicle_vin)
+                        and self._lastAppliedChargeLimit.get(vehicle_vin) == limit
+                    ):
+                        logger.debug(
+                            f"Not re-attempting apply charge limit {limit}% for {vehicle_vin}: already applied"
+                        )
+                        skipped_count += 1
+                        continue
+
+                    # Retrieve saved normal charge limit (outside TWCManager management)
+                    has_saved, outside_limit, last_applied = (
+                        self.master.getNormalChargeLimit(vehicle_vin)
+                    )
+
+                    if limit == -1:
+                        # Restore to the pre-TWCManager default
+                        if has_saved and outside_limit is not None:
+                            target_limit = outside_limit
+                            logger.debug(
+                                f"Restoring {vehicle_vin} to normal charge limit {target_limit}%"
+                            )
+                        else:
+                            # No saved limit; skip this vehicle
+                            logger.debug(
+                                f"No saved normal charge limit for {vehicle_vin}; skipping restore"
+                            )
+                            skipped_count += 1
+                            continue
+                    else:
+                        target_limit = limit
+
+                    attempted_count += 1
+
+                    # Wake vehicle first - don't fail if wake fails, but log it
+                    wake_result = self.wakeVehicle(vehicle_vin)
+                    if not wake_result:
+                        logger.warning(
+                            f"Wake command may have failed for {vehicle_vin}, proceeding with charge limit"
+                        )
+
+                    ret = self.sendCommand(
+                        vehicle_vin, "charging-set-limit", target_limit
+                    )
+                    if ret is not None and self.parseCommandOutput(ret):
+                        success_count += 1
+                        if limit == -1:
+                            # Restore: remove the flag and saved limit
+                            self._stopTryingToApplyLimit.pop(vehicle_vin, None)
+                            self._lastAppliedChargeLimit.pop(vehicle_vin, None)
+                            self.master.removeNormalChargeLimit(vehicle_vin)
+                            logger.info(
+                                f"Restored {vehicle_vin} to charge limit {target_limit}%"
+                            )
+                        else:
+                            # Apply: set the flag and remember this limit
+                            self._stopTryingToApplyLimit[vehicle_vin] = True
+                            self._lastAppliedChargeLimit[vehicle_vin] = limit
+                            self.master.saveNormalChargeLimit(
+                                vehicle_vin,
+                                outside_limit if has_saved else target_limit,
+                                limit,
+                            )
+                            logger.info(
+                                f"Set {vehicle_vin} to charge limit {target_limit}%"
+                            )
+                    else:
+                        logger.warning(
+                            f"Set charge limit {target_limit}% failed for vehicle {vehicle_vin}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"applyChargeLimit exception for vehicle {vehicle_vin}: {e}"
+                    )
+                    continue
+
+            # Only log if commands were actually attempted
+            if attempted_count > 0:
+                logger.info(
+                    f"Apply charge limit {limit}% result: {success_count}/{attempted_count} attempted vehicles succeeded"
+                    + (f", {skipped_count} skipped" if skipped_count > 0 else "")
+                )
+                overall_success = success_count > 0
+            else:
+                # All vehicles skipped; that's a successful handling
+                overall_success = True
+
+            return overall_success
+
+        except Exception as e:
+            logger.error(f"applyChargeLimit exception: {e}")
+            return False
+
     def startCharging(self, vin):
-        self.wakeVehicle(vin)
-        ret = self.sendCommand(vin, "charging-start")
-        return self.parseCommandOutput(ret)
+        try:
+            logger.debug(f"Starting charging for vehicle {vin}")
+
+            # Wake vehicle first - don't fail if wake fails, but log it
+            wake_result = self.wakeVehicle(vin)
+            if not wake_result:
+                logger.warning(
+                    f"Wake command may have failed for {vin}, proceeding with charge start"
+                )
+
+            ret = self.sendCommand(vin, "charging-start")
+            if ret is None:
+                logger.error(f"Failed to send charging-start command to {vin}")
+                return False
+
+            success = self.parseCommandOutput(ret)
+
+            # If the car reported it is already in the desired state, record
+            # that so car_api_charge won't re-send the command next cycle
+            # (mirrors TeslaAPI's stopAskingToStartCharging logic).
+            if success and self._is_already_satisfied(ret):
+                self._stopAskingToStartCharging[vin] = True
+                logger.info(
+                    "BLE: %s already in desired charge state; will not re-request" % vin
+                )
+            logger.info(
+                f"Start charging for {vin}: {'success' if success else 'failed'}"
+            )
+            return success
+
+        except Exception as e:
+            logger.error(f"startCharging exception for {vin}: {e}")
+            return False
 
     def stopCharging(self, vin):
-        ret = self.sendCommand(vin, "charging-stop")
-        return self.parseCommandOutput(ret)
+        """
+        Stop charging for a specific vehicle with enhanced error handling.
+        Returns True on success, False on failure.
+        """
+        try:
+            logger.debug(f"Stopping charging for vehicle {vin}")
+
+            ret = self.sendCommand(vin, "charging-stop")
+            if ret is None:
+                logger.error(f"Failed to send charging-stop command to {vin}")
+                return False
+
+            success = self.parseCommandOutput(ret)
+            logger.info(
+                f"Stop charging for {vin}: {'success' if success else 'failed'}"
+            )
+            return success
+
+        except Exception as e:
+            logger.error(f"stopCharging exception for {vin}: {e}")
+            return False
 
     def scanForVehicles(self):
         # This function allows other modules to prompt us to connect to BLE
@@ -226,37 +874,590 @@ class TeslaBLE:
             logger.log(logging.INFO2, "No known vehicles.")
 
     def wakeVehicle(self, vin):
-        self.sendCommand(vin, "wake")
+        """
+        Wake a vehicle from sleep mode.
+        Returns True on success, False on failure.
+        """
+        try:
+            logger.debug(f"Waking vehicle {vin}")
+
+            ret = self.sendCommand(vin, "wake")
+            if ret is None:
+                logger.debug(f"Failed to send wake command to {vin}")
+                return False
+
+            success = self.parseCommandOutput(ret)
+            logger.debug(f"Wake {vin}: {'success' if success else 'failed'}")
+            return success
+
+        except Exception as e:
+            logger.error(f"wakeVehicle exception for {vin}: {e}")
+            return False
+
+    def _extract_enum_value(self, val):
+        """Extract string key from Tesla protobuf enum format like {"Charging": {}}."""
+        if isinstance(val, dict) and val:
+            return next(iter(val))
+        return val
+
+    def _parse_proto_timestamp(self, val):
+        """Parse a protobuf Timestamp ({"seconds":…} or bare number) to Unix epoch."""
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, dict):
+            return float(val.get("seconds", 0)) or None
+        return None
+
+    def _fetch_state_json(self, vin, state_type):
+        """Run `tesla-control state STATE_TYPE` and return parsed JSON dict, or None."""
+        if not self.binaryPath or not os.path.isfile(self.binaryPath):
+            return None
+        if not self.master.settings.get("Vehicles", {}).get(vin):
+            return None
+
+        self.sendPrivateKey(vin)
+
+        command_string = [
+            self.binaryPath,
+            "-ble",
+            "-vin",
+            vin,
+            "-key-file",
+            self.pipeName,
+            "state",
+            state_type,
+        ]
+        if self.isDocker():
+            command_string.insert(0, "nsenter --net=/rootns/net")
+
+        try:
+            stdout, stderr, return_code = self._run_command_with_timeout(
+                command_string, timeout=self.commandTimeout
+            )
+            if stdout is None or return_code != 0:
+                logger.debug(
+                    f"BLE state {state_type} failed for {vin} (rc={return_code})"
+                )
+                return None
+            return json.loads(stdout.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
+            logger.debug(f"BLE state {state_type} JSON parse error for {vin}: {e}")
+            return None
+        finally:
+            self._ensure_pipe_closed()
+
+    def get_charge_state(self, vin):
+        """Fetch charge state via BLE. Returns normalized dict or None on failure."""
+        raw = self._fetch_state_json(vin, "charge")
+        if raw is None:
+            return None
+        cs = raw.get("chargeState")
+        if not cs:
+            logger.debug(f"BLE state charge: no chargeState in response for {vin}")
+            return None
+        return {
+            "batteryLevel": cs.get("batteryLevel"),
+            "chargeLimit": cs.get("chargeLimitSoc"),
+            "chargingState": self._extract_enum_value(cs.get("chargingState")),
+            "availableCurrent": cs.get("chargerPilotCurrent"),
+            "actualCurrent": cs.get("chargerActualCurrent"),
+            "voltage": cs.get("chargerVoltage"),
+            "phases": cs.get("chargerPhases"),
+            "scheduledChargingPending": cs.get("scheduledChargingPending"),
+            "timeToFullCharge": cs.get("timeToFullCharge"),
+        }
+
+    def get_location_state(self, vin):
+        """Fetch location state via BLE. Returns normalized dict or None on failure."""
+        raw = self._fetch_state_json(vin, "location")
+        if raw is None:
+            return None
+        ls = raw.get("locationState")
+        if not ls:
+            logger.debug(f"BLE state location: no locationState in response for {vin}")
+            return None
+        return {
+            "latitude": ls.get("latitude"),
+            "longitude": ls.get("longitude"),
+            "heading": ls.get("heading"),
+            "gpsAsOf": self._parse_proto_timestamp(ls.get("gpsAsOf")),
+        }
+
+    def _is_transient_error(self, output):
+        """Determine if error is transient (should retry) or permanent (fail fast)."""
+        if output is None:
+            return True  # Timeout or communication error - transient
+
+        output_lower = output.lower()
+
+        # Transient error indicators
+        transient_indicators = [
+            "timeout",
+            "timed out",
+            "connection refused",
+            "connection reset",
+            "connection timeout",
+            "device busy",
+            "resource temporarily unavailable",
+            "try again",
+            "retry",
+            "temporarily",
+            "broken pipe",
+            "no such file or directory",
+        ]
+
+        for indicator in transient_indicators:
+            if indicator in output_lower:
+                logger.debug(f"Detected transient error: {indicator}")
+                return True
+
+        return False
+
+    def _is_transient_exception(self, exception):
+        """Determine if exception is transient (should retry) or permanent (fail fast)."""
+        exc_str = str(exception).lower()
+
+        transient_indicators = [
+            "timeout",
+            "timed out",
+            "connection",
+            "broken pipe",
+            "resource temporarily unavailable",
+            "device busy",
+            "try again",
+        ]
+
+        for indicator in transient_indicators:
+            if indicator in exc_str:
+                logger.debug(f"Detected transient exception: {indicator}")
+                return True
+
+        return False
+
+    def _calculate_backoff(self, attempt):
+        """Calculate exponential backoff delay for retry."""
+        # Exponential backoff: 2^attempt * retryDelay
+        delay = (2**attempt) * self.retryDelay
+
+        # Cap at reasonable maximum (30 seconds)
+        max_delay = 30
+        return min(delay, max_delay)
+
+    def _init_retry_stats(self, vin):
+        """Initialize retry statistics for a vehicle."""
+        if vin not in self.retry_stats:
+            self.retry_stats[vin] = {
+                "total_attempts": 0,
+                "successful_retries": 0,
+                "failed_retries": 0,
+                "circuit_breaker_trips": 0,
+                "last_error": None,
+                "last_error_time": None,
+            }
+
+    def _record_retry_attempt(self, vin, success, error=None):
+        """Record a retry attempt for statistics."""
+        self._init_retry_stats(vin)
+        stats = self.retry_stats[vin]
+
+        stats["total_attempts"] += 1
+        if success:
+            stats["successful_retries"] += 1
+        else:
+            stats["failed_retries"] += 1
+
+        if error:
+            stats["last_error"] = error
+            stats["last_error_time"] = time.time()
+
+    def _execute_with_retry(self, func, vin, *args, **kwargs):
+        """
+        Execute a function with retry logic, exponential backoff, and circuit breaker.
+
+        Args:
+            func: Function to execute
+            vin: Vehicle VIN (for circuit breaker tracking)
+            *args, **kwargs: Arguments to pass to func
+
+        Returns:
+            Result from func, or None if all retries exhausted
+        """
+        self._init_retry_stats(vin)
+
+        # Check circuit breaker
+        if self.circuit_breaker.is_open(vin):
+            logger.warning(f"Circuit breaker OPEN for {vin}, skipping retry logic")
+            self.retry_stats[vin]["circuit_breaker_trips"] += 1
+            return None
+
+        for attempt in range(self.maxRetries + 1):
+            try:
+                result = func(vin, *args, **kwargs)
+
+                if result is not None:
+                    # Success
+                    self.circuit_breaker.record_success(vin)
+                    if attempt > 0:
+                        logger.info(
+                            f"BLE command succeeded on retry attempt {attempt + 1}/{self.maxRetries + 1} for {vin}"
+                        )
+                        self._record_retry_attempt(vin, True)
+                    return result
+
+                # Result is None - check if error is transient
+                if attempt < self.maxRetries:
+                    delay = self._calculate_backoff(attempt)
+                    logger.info(
+                        f"BLE command failed for {vin}, retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{self.maxRetries + 1})"
+                    )
+                    self._record_retry_attempt(vin, False, "transient_error")
+                    time.sleep(delay)
+                else:
+                    # All retries exhausted
+                    self.circuit_breaker.record_failure(vin)
+                    logger.error(
+                        f"BLE command failed for {vin} after {self.maxRetries + 1} attempts"
+                    )
+                    self._record_retry_attempt(vin, False, "max_retries_exceeded")
+                    return None
+
+            except Exception as e:
+                if self._is_transient_exception(e):
+                    if attempt < self.maxRetries:
+                        delay = self._calculate_backoff(attempt)
+                        logger.warning(
+                            f"BLE transient exception for {vin}: {e}, "
+                            f"retrying in {delay}s (attempt {attempt + 1}/{self.maxRetries + 1})"
+                        )
+                        self._record_retry_attempt(
+                            vin, False, f"transient_exception: {str(e)[:50]}"
+                        )
+                        time.sleep(delay)
+                    else:
+                        # All retries exhausted
+                        self.circuit_breaker.record_failure(vin)
+                        logger.error(
+                            f"BLE transient exception for {vin} after {self.maxRetries + 1} attempts: {e}"
+                        )
+                        self._record_retry_attempt(
+                            vin, False, f"exception_max_retries: {str(e)[:50]}"
+                        )
+                        return None
+                else:
+                    # Permanent error - don't retry
+                    logger.error(f"BLE permanent error for {vin}, not retrying: {e}")
+                    self._record_retry_attempt(
+                        vin, False, f"permanent_error: {str(e)[:50]}"
+                    )
+                    return None
+
+        return None
+
+    def _kill_process_group(self, pid, timeout=1.0):
+        """
+        Kill a process and its entire process group gracefully.
+        First tries SIGTERM, then SIGKILL if process doesn't die.
+
+        Args:
+            pid: Process ID to kill
+            timeout: Time to wait between SIGTERM and SIGKILL
+
+        Returns:
+            True if process was killed, False if already dead
+        """
+        try:
+            # Check if process is still alive
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                # Process is still running, try graceful shutdown first
+                try:
+                    # Get process group ID
+                    pgid = os.getpgid(pid)
+
+                    # Try SIGTERM first (graceful)
+                    logger.debug(f"Sending SIGTERM to process group {pgid}")
+                    os.killpg(pgid, signal.SIGTERM)
+
+                    # Wait for graceful shutdown
+                    time.sleep(timeout)
+
+                    # Check if process is still alive
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        # Still alive, use SIGKILL (brutal)
+                        logger.warning(
+                            f"Process {pid} didn't respond to SIGTERM, sending SIGKILL"
+                        )
+                        os.killpg(pgid, signal.SIGKILL)
+                        time.sleep(0.1)
+
+                    logger.debug(f"Process group {pgid} terminated")
+                    return True
+                except ProcessLookupError:
+                    # Process already dead
+                    logger.debug(f"Process {pid} already terminated")
+                    return False
+            else:
+                logger.debug(f"Process {pid} already dead")
+                return False
+        except Exception as e:
+            logger.warning(f"Error killing process group: {e}")
+            return False
+
+    def _start_dbus_session(self):
+        """Start a single persistent D-Bus session daemon for this module instance.
+
+        Parses the output of dbus-launch --sh-syntax to obtain the bus address
+        and daemon PID, then stores them for use by all subprocess invocations.
+        If dbus-launch is unavailable the module continues without a managed
+        session (tesla-control will still work, but may still accumulate daemons).
+        """
+        dbus_launch = shutil.which("dbus-launch")
+        if not dbus_launch:
+            logger.debug(
+                "dbus-launch not found; skipping persistent D-Bus session setup"
+            )
+            return
+        try:
+            result = subprocess.run(
+                [dbus_launch, "--sh-syntax"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            for line in result.stdout.decode(errors="replace").splitlines():
+                line = line.strip().rstrip(";")
+                if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                    self._dbus_session_address = line.split("=", 1)[1].strip("'\"")
+                elif line.startswith("DBUS_SESSION_BUS_PID="):
+                    try:
+                        self._dbus_session_pid = int(line.split("=", 1)[1].strip("'\""))
+                    except ValueError:
+                        pass
+            if self._dbus_session_address:
+                logger.debug(
+                    f"D-Bus session started (PID {self._dbus_session_pid}): "
+                    f"{self._dbus_session_address}"
+                )
+            else:
+                logger.warning(
+                    "dbus-launch ran but produced no DBUS_SESSION_BUS_ADDRESS"
+                )
+        except Exception as e:
+            logger.warning(f"Could not start persistent D-Bus session: {e}")
+
+    def _stop_dbus_session(self):
+        """Terminate the persistent D-Bus session daemon started by this module."""
+        if self._dbus_session_pid:
+            try:
+                os.kill(self._dbus_session_pid, signal.SIGTERM)
+                logger.debug(
+                    f"Terminated D-Bus session daemon PID {self._dbus_session_pid}"
+                )
+            except (ProcessLookupError, PermissionError):
+                pass
+            self._dbus_session_pid = None
+            self._dbus_session_address = None
+
+    def _run_command_with_timeout(
+        self, command_string, timeout, use_process_group=True
+    ):
+        """
+        Run a command with proper timeout handling and process group management.
+
+        Args:
+            command_string: List of command arguments
+            timeout: Timeout in seconds
+            use_process_group: Whether to use process groups (for Docker compatibility)
+
+        Returns:
+            Tuple of (stdout, stderr, return_code) or (None, None, None) on timeout
+        """
+        try:
+            # Prepare preexec_fn for process group creation
+            preexec_fn = None
+            if use_process_group and not self.isDocker():
+                # Create new process group (only works on Unix, not in Docker)
+                preexec_fn = os.setsid
+
+            logger.debug(
+                f"Running command with {timeout}s timeout: {' '.join(command_string[:3])}..."
+            )
+
+            # Pass the persistent D-Bus session address so that tesla-control's
+            # internal dbus-launch sees DBUS_SESSION_BUS_ADDRESS already set and
+            # skips spawning a new daemon.
+            env = os.environ.copy()
+            if self._dbus_session_address:
+                env["DBUS_SESSION_BUS_ADDRESS"] = self._dbus_session_address
+
+            result = subprocess.Popen(
+                command_string,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=preexec_fn,
+                env=env,
+            )
+
+            try:
+                # Use communicate with timeout
+                stdout, stderr = result.communicate(timeout=timeout)
+                return_code = result.returncode
+
+                logger.debug(f"Command completed with return code {return_code}")
+                return stdout, stderr, return_code
+
+            except subprocess.TimeoutExpired:
+                # Process timed out, kill it
+                logger.warning(
+                    f"Command timed out after {timeout}s, terminating process {result.pid}"
+                )
+
+                try:
+                    # Try to kill the process group
+                    if use_process_group:
+                        pgid = os.getpgid(result.pid)
+                        logger.debug(f"Killing process group {pgid}")
+                        os.killpg(pgid, signal.SIGTERM)
+                        time.sleep(0.5)
+
+                        # Check if still alive
+                        if result.poll() is None:
+                            logger.warning(
+                                f"Process group {pgid} didn't respond to SIGTERM, using SIGKILL"
+                            )
+                            os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        # Fallback: kill just the process
+                        result.terminate()
+                        time.sleep(0.5)
+                        if result.poll() is None:
+                            result.kill()
+
+                    # Wait for process to actually die
+                    result.wait(timeout=1.0)
+                except Exception as e:
+                    logger.error(f"Error terminating process: {e}")
+
+                return None, None, None
+
+        except Exception as e:
+            logger.error(f"Error running command: {e}")
+            return None, None, None
+
+    def _cleanup_stale_pipe(self):
+        """Clean up any stale pipe file from previous crashes."""
+        try:
+            if os.path.exists(self.pipeName):
+                os.unlink(self.pipeName)
+                logger.debug(f"Cleaned up stale pipe file: {self.pipeName}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up stale pipe file: {e}")
+
+    def _ensure_pipe_closed(self):
+        """Safely close pipe if it's open, tracking state."""
+        if self.pipeOpen and self.pipe is not None:
+            try:
+                self.pipe.close()
+                self.pipeOpen = False
+                logger.debug("Pipe closed successfully")
+            except Exception as e:
+                logger.warning(f"Error closing pipe: {e}")
+                self.pipeOpen = False
+
+        # Always try to clean up the file
+        try:
+            if os.path.exists(self.pipeName):
+                os.unlink(self.pipeName)
+        except Exception as e:
+            logger.debug(f"Could not remove pipe file: {e}")
 
     def closeFile(self):
-        self.pipe.close()
-        try:
-            os.unlink(self.pipeName)
-        except FileNotFoundError:
-            pass
+        """Close pipe file with proper error handling and state tracking."""
+        self._ensure_pipe_closed()
 
     def openFile(self):
-        # Open output file for passing data to tesla-control
-        self.pipe = open(self.pipeName, "wb", 0)
+        """Open output file for passing data to tesla-control with error handling."""
+        try:
+            # Ensure any previous pipe is closed
+            if self.pipeOpen:
+                self._ensure_pipe_closed()
+
+            # Open new pipe file with buffering disabled
+            self.pipe = open(self.pipeName, "wb", 0)
+            self.pipeOpen = True
+            logger.debug(f"Pipe opened successfully: {self.pipeName}")
+        except Exception as e:
+            logger.error(f"Failed to open pipe file: {e}")
+            self.pipe = None
+            self.pipeOpen = False
+            raise
 
     def sendPublicKey(self, vin):
-        self.openFile()
-        self.pipe.write(
-            base64.b64decode(self.master.settings["Vehicles"][vin]["pubKeyPEM"]),
-        )
+        """Send public key to vehicle via pipe with error handling."""
+        try:
+            if vin not in self.master.settings.get("Vehicles", {}):
+                logger.error(f"Vehicle {vin} not found in settings")
+                return False
+
+            if "pubKeyPEM" not in self.master.settings["Vehicles"][vin]:
+                logger.error(f"Vehicle {vin} has no pubKeyPEM defined")
+                return False
+
+            self.openFile()
+            if not self.pipeOpen or self.pipe is None:
+                logger.error("Failed to open pipe for public key transmission")
+                return False
+
+            self.pipe.write(
+                base64.b64decode(self.master.settings["Vehicles"][vin]["pubKeyPEM"]),
+            )
+            self.pipe.flush()  # Ensure data is written
+            logger.debug(f"Public key sent for vehicle {vin}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending public key for {vin}: {e}")
+            return False
+        # NOTE: Do NOT close pipe here - it needs to stay open for tesla-control to read
 
     def sendPrivateKey(self, vin):
-        if vin in self.master.settings["Vehicles"]:
-            if "privKey" in self.master.settings["Vehicles"][vin]:
-                self.openFile()
-                self.pipe.write(
-                    base64.b64decode(self.master.settings["Vehicles"][vin]["privKey"]),
-                )
+        """Send private key to vehicle via pipe with error handling."""
+        try:
+            if vin not in self.master.settings.get("Vehicles", {}):
+                logger.error(f"Vehicle {vin} not found in settings")
+                return False
+
+            if "privKey" not in self.master.settings["Vehicles"][vin]:
+                logger.debug(f"Vehicle {vin} has no privKey defined, skipping")
+                return True  # Not an error, just skip
+
+            self.openFile()
+            if not self.pipeOpen or self.pipe is None:
+                logger.error("Failed to open pipe for private key transmission")
+                return False
+
+            self.pipe.write(
+                base64.b64decode(self.master.settings["Vehicles"][vin]["privKey"]),
+            )
+            self.pipe.flush()  # Ensure data is written
+            logger.debug(f"Private key sent for vehicle {vin}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending private key for {vin}: {e}")
+            return False
+        # NOTE: Do NOT close pipe here - it needs to stay open for tesla-control to read
+
+    def enabled(self) -> bool:
+        return self._enabled
 
     def updateSettings(self):
         # Called by TWCMaster when settings are read/updated
         self.scanForVehicles()
         return True
+
+    def __del__(self):
+        self._stop_dbus_session()
 
     def isDocker(self):
         if self.isDockerCached is not None:

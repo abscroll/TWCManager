@@ -98,7 +98,7 @@ Status interfaces publish TWCManager status information to external systems. Cur
 
 | Platform                                     | Details                 |
 | -------------------------------------------- | ----------------------- |
-| [HomeAssistant](docs/modules/Status_HASS.md) | Provides HASS sensors to monitor TWCManager State |
+| [HomeAssistant] | Deprecated, please use the MQTT status with Home Assistant autodiscovery |
 | [MQTT](docs/modules/Status_MQTT.md)          | Publishes MQTT topics to monitor TWCManager State |
 
 ### Vehicle Interfaces
@@ -108,6 +108,7 @@ Status interfaces publish TWCManager status information to external systems. Cur
 | TeslaAPI    | Allows start/stop charging via Tesla API |
 | [TeslaBLE](docs/modules/Vehicle_TeslaBLE.md) | Allows start/stop charging via Bluetooth Low Energy |
 | [TeslaMate](docs/modules/Vehicle_TeslaMate.md) | TeslaMate integration (Tesla API Tokens) |
+| [Home Assistant](docs/modules/Vehicle_HomeAssistant.md) | Tesla Fleet via Home Assistant |
 
 ## Warnings
 

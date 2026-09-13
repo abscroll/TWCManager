@@ -1,7 +1,8 @@
 import logging
 import re
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger(__name__.rsplit(".")[-1])
+logger = LoggerFactory.get_logger("TWCProtocol", "Protocol")
 
 
 class TWCProtocol:
@@ -38,15 +39,22 @@ class TWCProtocol:
             # Send a custom command. This can be dangerous!
 
             # Let's first check if any dangerous command is sent
-            if packet["CustomCommand"].lower().startswith("fc19") or packet[
-                "CustomCommand"
-            ].lower().startswith("fc1a"):
+            # Convert CustomCommand to string for comparison if it's bytes
+            custom_cmd = packet["CustomCommand"]
+            if isinstance(custom_cmd, bytearray):
+                custom_cmd = custom_cmd.decode("utf-8", errors="ignore")
+
+            custom_cmd_lower = custom_cmd.lower()
+
+            if custom_cmd_lower.startswith("fc19") or custom_cmd_lower.startswith(
+                "fc1a"
+            ):
                 self.master.lastTWCResponseMsg = bytearray(
                     b"Command blocked as it may cause your TWC to be permanently disabled!"
                 )
                 return
 
-            if packet["CustomCommand"].lower().startswith("fbe8"):
+            if custom_cmd_lower.startswith("fbe8"):
                 self.master.lastTWCResponseMsg = bytearray(
                     b"Command blocked as it may cause your TWC to crash!"
                 )
@@ -80,7 +88,9 @@ class TWCProtocol:
                 bytearray(b"\xfd\xe0")
                 + packet["SenderID"]
                 + packet["RecieverID"]
-                + bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
+                + packet.get(
+                    "HeartbeatData", bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
+                )
             )
             if self.master.protocolVersion == 2:
                 msg += bytearray(b"\x00\x00")
@@ -105,7 +115,7 @@ class TWCProtocol:
         packet = {"Command": None, "Errors": [], "SenderID": None, "Match": False}
 
         msgMatch = re.search(
-            b"\xfc\xe1(..)(.)\x00\x00\x00\x00\x00\x00\x00\x00+?.*\Z",
+            rb"\xfc\xe1(..)(.)\x00\x00\x00\x00\x00\x00\x00\x00+?.*\Z",
             msg,
             re.DOTALL,
         )
@@ -138,7 +148,7 @@ class TWCProtocol:
 
         else:
             msgMatch = re.search(
-                b"\xfb\xe2(..)(.)\x00\x00\x00\x00\x00\x00\x00\x00+?.*\Z",
+                rb"\xfb\xe2(..)(.)\x00\x00\x00\x00\x00\x00\x00\x00+?.*\Z",
                 msg,
                 re.DOTALL,
             )
@@ -166,7 +176,7 @@ class TWCProtocol:
 
             else:
                 msgMatch = re.search(
-                    b"\A\xfb\xe0(..)(..)(.......+?).\Z", msg, re.DOTALL
+                    rb"\A\xfb\xe0(..)(..)(.......+?).\Z", msg, re.DOTALL
                 )
             if msgMatch and packet["Match"] == False:
                 # Handle heartbeat message from Master.
@@ -174,7 +184,7 @@ class TWCProtocol:
                 packet["Match"] = True
                 packet["Command"] = "MasterHeartbeat"
                 packet["SenderID"] = msgMatch.group(1)
-                packet["ReceiverID"] = msgMatch.group(2)
+                packet["RecieverID"] = msgMatch.group(2)
                 packet["HeartbeatData"] = msgMatch.group(3)
 
         return packet

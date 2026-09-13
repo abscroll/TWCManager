@@ -1,25 +1,22 @@
 import logging
+import os
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U0001f3ae MQTT")
+logger = LoggerFactory.get_logger("MQTT", "Control")
 
 
 class MQTTControl:
     import paho.mqtt.client as mqtt
     import _thread
 
-    brokerIP = None
-    brokerPort = 1883
     __client = None
     config = None
     configConfig = None
     configMQTT = None
     connectionState = 0
     master = None
-    password = None
     status = False
-    serverTLS = False
     topicPrefix = None
-    username = None
 
     def __init__(self, master):
         self.config = master.config
@@ -32,9 +29,12 @@ class MQTTControl:
         except KeyError:
             self.configMQTT = {}
         self.status = self.configMQTT.get("enabled", False)
-        self.brokerIP = self.configMQTT.get("brokerIP", None)
         self.master = master
         self.topicPrefix = self.configMQTT.get("topicPrefix", None)
+        self.brokerIP = self.configMQTT.get("brokerIP", None)
+        brokerTLS = self.configMQTT.get("brokerTLS", False)
+        # Default to 8883 for TLS, 1883 for plain MQTT
+        self.brokerPort = self.configMQTT.get("brokerPort", 8883 if brokerTLS else 1883)
         self.username = self.configMQTT.get("username", None)
         self.password = self.configMQTT.get("password", None)
 
@@ -58,6 +58,7 @@ class MQTTControl:
                     self.__client = self.mqtt.Client("MQTTCtrl")
                 if self.username and self.password:
                     self.__client.username_pw_set(self.username, self.password)
+
                 self.__client.on_connect = self.mqttConnect
                 self.__client.on_message = self.mqttMessage
                 self.__client.on_subscribe = self.mqttSubscribe
@@ -68,11 +69,11 @@ class MQTTControl:
                 except ConnectionRefusedError as e:
                     logger.log(logging.INFO4, "Error connecting to MQTT Broker")
                     logger.debug(str(e))
-                    return False
+                    return
                 except OSError as e:
                     logger.log(logging.INFO4, "Error connecting to MQTT Broker")
                     logger.debug(str(e))
-                    return False
+                    return
 
                 self.connectionState = 1
                 self.__client.loop_start()
@@ -97,10 +98,33 @@ class MQTTControl:
             )
             plsplit = payload.split(",", 1)
             if len(plsplit) == 2:
-                self.master.setChargeNowAmps(int(plsplit[0]))
-                self.master.setChargeNowTimeEnd(int(plsplit[1]))
-                self.master.getModuleByName("Policy").applyPolicyImmediately()
-                self.master.queue_background_task({"cmd": "saveSettings"})
+                try:
+                    amps = int(plsplit[0])
+                    seconds = int(plsplit[1])
+
+                    # Validate amps: must be between 1 and maxAmpsPerTWC
+                    maxAmps = self.configConfig.get("maxAmpsPerTWC", 32)
+                    if amps < 1 or amps > maxAmps:
+                        logger.warning(
+                            f"MQTT chargeNow rejected: amps {amps} out of valid range [1, {maxAmps}]"
+                        )
+                        return
+
+                    # Validate seconds: must be positive
+                    if seconds < 0:
+                        logger.warning(
+                            f"MQTT chargeNow rejected: seconds {seconds} must be non-negative"
+                        )
+                        return
+
+                    self.master.setChargeNowAmps(amps)
+                    self.master.setChargeNowTimeEnd(seconds)
+                    self.master.getModuleByName("Policy").applyPolicyImmediately()
+                    self.master.queue_background_task({"cmd": "saveSettings"})
+                except ValueError as e:
+                    logger.warning(
+                        f"MQTT chargeNow command failed: invalid format - {str(e)}"
+                    )
             else:
                 logger.info(
                     "MQTT chargeNow command failed: Expecting comma seperated string in format amps,seconds"
@@ -115,6 +139,49 @@ class MQTTControl:
         if message.topic == self.topicPrefix + "/control/stop":
             logger.log(logging.INFO3, "MQTT Message called Stop")
             self._thread.interrupt_main()
+
+        if message.topic == self.topicPrefix + "/control/nonScheduledAmpsMax":
+            payload = str(message.payload.decode("utf-8"))
+            logger.log(
+                logging.INFO3,
+                "MQTT Message called nonScheduledAmpsMax with payload " + payload,
+            )
+            try:
+                amps = int(payload)
+                maxAmps = self.configConfig.get("wiringMaxAmpsAllTWCs", 32)
+                if amps < 0 or amps > maxAmps:
+                    logger.warning(
+                        f"MQTT nonScheduledAmpsMax rejected: {amps} out of valid range [0, {maxAmps}]"
+                    )
+                    return
+                self.master.setNonScheduledAmpsMax(amps)
+                self.master.getModuleByName("Policy").applyPolicyImmediately()
+                self.master.queue_background_task({"cmd": "saveSettings"})
+            except ValueError as e:
+                logger.warning(
+                    f"MQTT nonScheduledAmpsMax command failed: invalid value - {str(e)}"
+                )
+
+        if message.topic == self.topicPrefix + "/control/nonScheduledAction":
+            payload = str(message.payload.decode("utf-8"))
+            logger.log(
+                logging.INFO3,
+                "MQTT Message called nonScheduledAction with payload " + payload,
+            )
+            try:
+                action = int(payload)
+                if action not in (1, 2, 3):
+                    logger.warning(
+                        f"MQTT nonScheduledAction rejected: {action} must be 1 (fixed rate), 2 (do not charge), or 3 (track green energy)"
+                    )
+                    return
+                self.master.settings["nonScheduledAction"] = action
+                self.master.getModuleByName("Policy").applyPolicyImmediately()
+                self.master.queue_background_task({"cmd": "saveSettings"})
+            except ValueError as e:
+                logger.warning(
+                    f"MQTT nonScheduledAction command failed: invalid value - {str(e)}"
+                )
 
     def mqttSubscribe(self, client, userdata, mid, reason_codes, properties=None):
         logger.info("Subscribe operation completed with mid " + str(mid))

@@ -8,3 +8,11 @@ venv/
 settings.json
 .DS_Store
 .venv/
+.venv-server/
+/config.json
+/runtime/
+# Root-level markdown files (scratch notes, plans, CLAUDE.md, etc.)
+# Does not affect docs/ or any subdirectory
+/*.md
+.coverage
+test-results/

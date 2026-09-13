@@ -1,7 +1,8 @@
 import logging
 import json
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U000026a1 DSMRread")
+logger = LoggerFactory.get_logger("DSMRread", "EMS")
 
 
 class DSMRreader:
@@ -29,7 +30,7 @@ class DSMRreader:
         except KeyError:
             self.__configConfig = {}
         try:
-            self.__configDSMRreader = master.config["sources"]["DSMRreader"]
+            self.__configDSMRreader = master.config.get("sources", {})["DSMRreader"]
         except KeyError:
             self.__configDSMRreader = {}
 

@@ -3,9 +3,9 @@
 
 import logging
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-
-logger = logging.getLogger("\U0001f4ca HASS")
+logger = LoggerFactory.get_logger("HASS", "Status")
 
 
 class HASSStatus:
@@ -58,6 +58,9 @@ class HASSStatus:
         ):
             self.master.releaseModule("lib.TWCManager.Status", "HASSStatus")
         else:
+            logger.warning(
+                f"HassStatus is depracated, and may be removed in future releases. Please migrate to MQTT Status with Home Assistant autodiscovery."
+            )
             self.backgroundTasksThread = self.threading.Thread(
                 target=self.background_task_thread, args=()
             )
