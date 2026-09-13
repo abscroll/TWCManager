@@ -25,8 +25,12 @@ class SMA:
         self.url = self.configSMA.get("url")
         self.user = self.configSMA.get("user", "user")
         self.password = self.configSMA.get("password")
-        self.status = bool(self.configSMA.get("enabled", False) and self.url
-                           and self.user and self.password)
+        self.status = bool(
+            self.configSMA.get("enabled", False)
+            and self.url
+            and self.user
+            and self.password
+        )
         self.cacheTime = max(1, float(self.configSMA.get("cacheTime", 10)))
         self.timeout = max(1, float(self.configSMA.get("timeout", 30)))
         self.generatedW = self.consumedW = 0
@@ -49,14 +53,13 @@ class SMA:
 
     async def getSensors(self):
         async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(
-                ssl=self.configSMA.get("verifySSL", False)
-            ),
+            connector=aiohttp.TCPConnector(ssl=self.configSMA.get("verifySSL", False)),
             timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as session:
             client_class = SMAWebConnect or pysma.SMA
-            client = client_class(session, self.url, password=self.password,
-                                  group=self.user)
+            client = client_class(
+                session, self.url, password=self.password, group=self.user
+            )
             await client.new_session()
             try:
                 if SMAWebConnect is not None:
@@ -77,8 +80,9 @@ class SMA:
 
     def update(self):
         now = time.monotonic()
-        if not self.status or (self._lastAttempt is not None
-                               and now - self._lastAttempt < self.cacheTime):
+        if not self.status or (
+            self._lastAttempt is not None and now - self._lastAttempt < self.cacheTime
+        ):
             return False
         self._lastAttempt = now
         try:
@@ -88,10 +92,14 @@ class SMA:
                 raise ValueError("Non-finite SMA reading")
             generation, supplied, absorbed = values
             # Preserve the fork's import/export calculation.
-            consumption = generation - supplied if supplied > absorbed else generation + absorbed
+            consumption = (
+                generation - supplied if supplied > absorbed else generation + absorbed
+            )
         except Exception as error:
             self.fetchFailed = True
-            logger.warning("SMA poll failed (%s); retaining cached readings", type(error).__name__)
+            logger.warning(
+                "SMA poll failed (%s); retaining cached readings", type(error).__name__
+            )
             return False
         self.sensors = sensors
         self.generatedW, self.consumedW = generation, consumption
