@@ -1,12 +1,12 @@
 import logging
+import time
 import socket
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-
-logger = logging.getLogger(__name__.rsplit(".")[-1])
+logger = LoggerFactory.get_logger("TCP", "Interface")
 
 
 class TCP:
-    import time
 
     config = None
     configTCP = None
@@ -92,4 +92,4 @@ class TCP:
 
         self.sock.send(msg)
 
-        self.timeLastTx = self.time.time()
+        self.timeLastTx = time.time()

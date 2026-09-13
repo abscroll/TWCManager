@@ -8,6 +8,7 @@ import threading
 import time
 
 from TWCManager.Vehicle.Telemetry import TelmetryBase
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
 
 def fix_base64_padding(data):
@@ -35,7 +36,7 @@ def fix_base64_padding(data):
     return data
 
 
-logger = logging.getLogger("\U0001f697 TeslaMate")
+logger = LoggerFactory.get_logger("TeslaMate", "Vehicle")
 
 
 class TeslaMateVehicle(TelmetryBase):
@@ -79,8 +80,17 @@ class TeslaMateVehicle(TelmetryBase):
         if self.syncTokens:
             self.doSyncTokens(True)
 
-            # After initial sync, set a timer to continue to sync the tokens every hour
-            resync = threading.Timer(3600, self.doSyncTokens)
+            # After initial sync, keep resyncing the tokens every hour
+            self.scheduleTokenResync()
+
+    def scheduleTokenResync(self):
+        resync = threading.Timer(3600, self.resyncTokens)
+        resync.daemon = True
+        resync.start()
+
+    def resyncTokens(self):
+        self.doSyncTokens()
+        self.scheduleTokenResync()
 
     def decrypt_data(self, encrypted_data):
         """

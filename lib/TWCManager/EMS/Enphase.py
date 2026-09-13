@@ -1,8 +1,9 @@
 # Enphase Monitoring Portal Integration
 import logging
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U000026c5 Enphase")
+logger = LoggerFactory.get_logger("Enphase", "EMS")
 
 
 class Enphase:
@@ -25,6 +26,7 @@ class Enphase:
     status = False
     systemID = None
     timeout = 10
+    token = None
     userID = None
     voltage = 0
 
@@ -36,7 +38,7 @@ class Enphase:
         except KeyError:
             self.configConfig = {}
         try:
-            self.configEnphase = master.config["sources"]["Enphase"]
+            self.configEnphase = master.config.get("sources", {})["Enphase"]
         except KeyError:
             self.configEnphase = {}
         self.apiKey = self.configEnphase.get("apiKey", None)
@@ -44,6 +46,7 @@ class Enphase:
         self.serverPort = self.configEnphase.get("serverPort", 80)
         self.status = self.configEnphase.get("enabled", False)
         self.systemID = self.configEnphase.get("systemID", None)
+        self.token = self.configEnphase.get("token", None)
         self.userID = self.configEnphase.get("userID", None)
 
         # Unload if this module is disabled or misconfigured
@@ -97,8 +100,15 @@ class Enphase:
         # Fetch the specified URL from the Enphase Portal and return the data
         self.fetchFailed = False
 
+        # Envoy firmware 7.x requires a JWT Bearer token for local API access
+        headers = {}
+        if self.token and self.serverIP:
+            headers["Authorization"] = "Bearer " + self.token
+
         try:
-            r = self.requests.get(url, timeout=self.timeout)
+            r = self.requests.get(
+                url, timeout=self.timeout, headers=headers, verify=False
+            )
         except self.requests.exceptions.ConnectionError as e:
             logger.log(
                 logging.INFO4,
@@ -132,10 +142,15 @@ class Enphase:
                     if self.apiKey and self.userID and self.systemID:
                         self.generatedW = int(portalData["current_power"])
                     elif self.serverIP and self.serverPort:
-                        self.generatedW = int(portalData["production"][1]["wNow"])
-                        self.consumedW = int(portalData["consumption"][0]["wNow"])
-                        self.voltage = int(portalData["consumption"][0]["rmsVoltage"])
-                except (KeyError, TypeError) as e:
+                        # Check that production and consumption arrays have required elements
+                        if len(portalData.get("production", [])) > 1:
+                            self.generatedW = int(portalData["production"][1]["wNow"])
+                        if len(portalData.get("consumption", [])) > 0:
+                            self.consumedW = int(portalData["consumption"][0]["wNow"])
+                            self.voltage = int(
+                                portalData["consumption"][0]["rmsVoltage"]
+                            )
+                except (KeyError, TypeError, IndexError) as e:
                     logger.log(
                         logging.INFO4,
                         "Exception during parsing Enphase data (current_power)",

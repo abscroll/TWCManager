@@ -2,9 +2,9 @@ from datetime import datetime
 import logging
 import re
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-
-logger = logging.getLogger("\u26fd Slave")
+logger = LoggerFactory.get_logger("Slave", "Slave")
 
 
 class TWCSlave:
@@ -31,7 +31,6 @@ class TWCSlave:
     reportedAmpsMax = 0
     reportedAmpsActual = 0
     reportedState = 0
-    reportedAmpsLast = -1
 
     # history* vars are used to track power usage over time
     historyAvgAmps = 0
@@ -66,9 +65,12 @@ class TWCSlave:
     voltsPhaseC = 0
     isCharging = 0
     lastChargingStart = 0
+    chargingDroppedBelowThresholdTime = 0
     VINData = ["", "", ""]
     currentVIN = ""
     lastVIN = ""
+
+    vehicleModule = None
 
     def __init__(self, TWCID, maxAmps, config, master):
         self.config = config
@@ -77,12 +79,37 @@ class TWCSlave:
         self.TWCID = TWCID
         self.maxAmps = maxAmps
         self.APIcontrol = False
+        self.vehicleRateRaised = False
+        self.__vehicleRateRaiseAttemptTime = 0
 
         self.wiringMaxAmps = self.configConfig.get("wiringMaxAmpsPerTWC", 6)
         self.useFlexAmpsToStartCharge = self.configConfig.get(
             "useFlexAmpsToStartCharge", False
         )
         self.startStopDelay = self.configConfig.get("startStopDelay", 60)
+        self.vehicleModule = self.get_vehicle_module()
+
+    def get_vehicle_module(self):
+        # Try to use VehiclePriority proxy for fallback logic
+        vehiclePriority = self.master.getModuleByName("VehiclePriority")
+        if vehiclePriority:
+            return vehiclePriority
+
+        # Fallback to direct module selection if VehiclePriority not available
+        carHass = self.master.getModuleByName("HomeAssistant")
+        if carHass:
+            return carHass
+
+        carble = self.master.getModuleByName("TeslaBLE")
+        if carble:
+            return carble
+
+        carapi = self.master.getModuleByName("TeslaAPI")
+        if carapi:
+            return carapi
+
+        logger.error("No vehicle module enabled")
+        return None
 
     def print_status(self, heartbeatData):
         try:
@@ -534,7 +561,7 @@ class TWCSlave:
                     # more than once per minute. Once the car gets the message to
                     # stop, reportedAmpsActualSignificantChangeMonitor should drop
                     # to near zero within a few seconds.
-                    self.master.stopCarsCharging()
+                    self.master.stopCarsCharging(self.currentVIN)
             elif (
                 self.lastAmpsOffered >= self.config["config"]["minAmpsPerTWC"]
                 and self.reportedAmpsActual < 1.0
@@ -542,7 +569,21 @@ class TWCSlave:
             ):
                 # Car is not charging and is not reporting an error state, so
                 # try starting charge via car api.
-                self.master.startCarsCharging()
+                self.master.startCarsCharging(self.currentVIN)
+            elif self.reportedAmpsActual >= 1.0:
+                # At least one plugged in car is successfully charging. We don't
+                # know which car it is, so we must set
+                # vehicle.stopAskingToStartCharging = False on all vehicles such
+                # that if any vehicle is not charging without us calling
+                # car_api_charge(False), we'll try to start it charging again at
+                # least once. This probably isn't necessary but might prevent
+                # some unexpected case from never starting a charge. It also
+                # seems less confusing to see in the output that we always try
+                # to start API charging after the car stops taking a charge.
+                for vehicle in self.master.getModuleByName(
+                    "TeslaAPI"
+                ).getCarApiVehicles():
+                    vehicle.stopAskingToStartCharging = False
 
         self.master.getModulesByType("Interface")[0]["ref"].send(
             bytearray(b"\xfb\xe0")
@@ -562,6 +603,7 @@ class TWCSlave:
         self.reportedAmpsMax = ((heartbeatData[1] << 8) + heartbeatData[2]) / 100
         self.reportedAmpsActual = ((heartbeatData[3] << 8) + heartbeatData[4]) / 100
         self.reportedState = heartbeatData[0]
+        self.refreshingChargerLoadStatus()
 
         if self.reportedState == 0x02:
             logger.info(
@@ -573,18 +615,15 @@ class TWCSlave:
                 )
             )
 
-        if self.reportedAmpsActual != self.reportedAmpsLast:
-            self.reportedAmpsLast = self.reportedAmpsActual
-            for module in self.master.getModulesByType("Status"):
-                module["ref"].setStatus(
-                    self.TWCID, "amps_in_use", "ampsInUse", self.reportedAmpsActual, "A"
-                )
-            self.refreshingChargerLoadStatus()
-            self.master.refreshingTotalAmpsInUseStatus()
+        self.refreshingChargerLoadStatus()
+        self.master.refreshingTotalAmpsInUseStatus()
 
         for module in self.master.getModulesByType("Status"):
             module["ref"].setStatus(
                 self.TWCID, "amps_max", "ampsMax", self.reportedAmpsMax, "A"
+            )
+            module["ref"].setStatus(
+                self.TWCID, "amps_in_use", "ampsInUse", self.reportedAmpsActual, "A"
             )
             module["ref"].setStatus(
                 self.TWCID, "state", "state", self.reportedState, ""
@@ -625,7 +664,7 @@ class TWCSlave:
             lastVehicle = self.getLastVehicle()
             if (
                 lastVehicle is not None
-                and lastVehicle.chargingState is "Charging"
+                and lastVehicle.chargingState == "Charging"
                 and lastVehicle.timeToFullCharge * 60 <= 5
             ):
                 lastVehicle.stopAskingToStartCharging = True
@@ -644,10 +683,6 @@ class TWCSlave:
         ):
             self.timeReportedAmpsActualChangedSignificantly = now
             self.reportedAmpsActualSignificantChangeMonitor = self.reportedAmpsActual
-            for module in self.master.getModulesByType("Status"):
-                module["ref"].setStatus(
-                    self.TWCID, "power", "power", self.reportedAmpsActual, "A"
-                )
 
         ltNow = time.localtime()
         hourNow = ltNow.tm_hour + (ltNow.tm_min / 60)
@@ -662,8 +697,34 @@ class TWCSlave:
 
         # Determine how many cars are charging and how many amps they're using
         numCarsCharging = self.master.num_cars_charging_now()
-        desiredAmpsOffered = self.master.getMaxAmpsToDivideAmongSlaves()
-        flex = self.master.getAllowedFlex()
+
+        # Phase 4: if the centralized EVSE power distributor has pre-computed a
+        # per-EVSE target (via Gen2TWC.setTargetPower), use it directly and skip
+        # the per-car fair-share calculation below.  All downstream logic (6A
+        # spike workaround, dampen, timing guards, send) still applies.
+        _centralized_target = getattr(self, "_evseTargetAmps", None)
+        if _centralized_target is not None:
+            desiredAmpsOffered = _centralized_target
+            flex = 0
+        else:
+            desiredAmpsOffered = self.master.getMaxAmpsToDivideAmongSlaves()
+            flex = self.master.getAllowedFlex()
+
+            if numCarsCharging > 0:
+                desiredAmpsOffered -= sum(
+                    slaveTWC.reportedAmpsActual
+                    for slaveTWC in self.master.getSlaveTWCs()
+                    if slaveTWC.TWCID != self.TWCID
+                )
+                flex = self.master.getAllowedFlex() / numCarsCharging
+
+                # Allocate this slave a fraction of maxAmpsToDivideAmongSlaves
+                # divided by the number of cars actually charging.
+                fairShareAmps = int(
+                    self.master.getMaxAmpsToDivideAmongSlaves() / numCarsCharging
+                )
+                if desiredAmpsOffered > fairShareAmps:
+                    desiredAmpsOffered = fairShareAmps
 
         # Get charge rate control mode from settings
         # 1 = Use TWC Exclusively to control Charge Rate
@@ -671,22 +732,7 @@ class TWCSlave:
         # 3 = Use TWC >= 6A + Tesla API < 6A to control Charge Rate
         chargeRateControl = int(self.master.settings.get("chargeRateControl", 1))
 
-        if numCarsCharging > 0:
-            desiredAmpsOffered -= sum(
-                slaveTWC.reportedAmpsActual
-                for slaveTWC in self.master.getSlaveTWCs()
-                if slaveTWC.TWCID != self.TWCID
-            )
-            flex = self.master.getAllowedFlex() / numCarsCharging
-
-            # Allocate this slave a fraction of maxAmpsToDivideAmongSlaves divided
-            # by the number of cars actually charging.
-            fairShareAmps = int(
-                self.master.getMaxAmpsToDivideAmongSlaves() / numCarsCharging
-            )
-            if desiredAmpsOffered > fairShareAmps:
-                desiredAmpsOffered = fairShareAmps
-
+        if _centralized_target is None and numCarsCharging > 0:
             logger.debug(
                 "desiredAmpsOffered TWC: "
                 + self.master.hex_str(self.TWCID)
@@ -817,6 +863,8 @@ class TWCSlave:
             # Control is given to the Tesla API to control Charge Rate
             # We offer the maximum wiring amps from the TWC, and ask the API to control charge rate
             self.APIcontrol = True
+            self.vehicleRateRaised = False
+            self.__vehicleRateRaiseAttemptTime = 0
 
             # Call the Tesla API to set the charge rate for vehicle connected to this TWC
             # TODO: Identify vehicle
@@ -841,30 +889,26 @@ class TWCSlave:
                     None if self.getLastVehicle() is None else self.getLastVehicle()
                 )
 
-                if not self.master.getModuleByName(
-                    "TeslaBLE"
-                ) or not self.master.getModuleByName("TeslaBLE").setChargeRate(
-                    int(desiredAmpsOffered), targetVehicle
-                ):
-                    self.master.getModuleByName("TeslaAPI").setChargeRate(
-                        int(desiredAmpsOffered), targetVehicle
-                    )
+                self.vehicleModule.setChargeRate(int(desiredAmpsOffered), targetVehicle)
 
             desiredAmpsOffered = self.wiringMaxAmps
 
         else:
-            # If we just switched from API to TWC make sure the car is set to a
-            # high enough charge rate so it is not limiting the TWC control
-            if chargeRateControl == 3 and self.APIcontrol:
-                if not self.master.getModuleByName(
-                    "TeslaBLE"
-                ) or not self.master.getModuleByName("TeslaBLE").setChargeRate(
+            # TWC is controlling the charge rate here. The car only ever
+            # charges at min(TWC offer, car's own charge rate limit), so make
+            # sure the car isn't left capped below what TWC is about to offer
+            # (e.g. leftover from API control, the Tesla app, or never raised
+            # since startup) before relying on the TWC-side value alone.
+            if not self.vehicleRateRaised and (
+                now - self.__vehicleRateRaiseAttemptTime >= 60
+            ):
+                self.__vehicleRateRaiseAttemptTime = now
+                result = self.vehicleModule.setChargeRate(
                     self.wiringMaxAmps, self.getLastVehicle()
-                ):
-                    self.master.getModuleByName("TeslaAPI").setChargeRate(
-                        self.wiringMaxAmps, self.getLastVehicle()
-                    )
-                self.APIcontrol = False
+                )
+                if result is not False:
+                    self.vehicleRateRaised = True
+            self.APIcontrol = False
 
             # We can tell the TWC how much power to use in 0.01A increments, but
             # the car will only alter its power in larger increments (somewhere
@@ -1144,15 +1188,21 @@ class TWCSlave:
 
             if self.lastAmpsOffered != oldLastAmpsOffered:
                 self.timeLastAmpsOfferedChanged = time.time()
+
+        self._publishStatus("amps_offered", "ampsOffered", self.lastAmpsOffered, "A")
+        self._publishStatus("amps_desired", "ampsDesired", desiredAmpsOffered, "A")
+
         return self.lastAmpsOffered
+
+    def _publishStatus(self, key_underscore, key_camelcase, value, unit):
+        for module in self.master.getModulesByType("Status"):
+            module["ref"].setStatus(
+                self.TWCID, key_underscore, key_camelcase, value, unit
+            )
 
     def setLifetimekWh(self, kwh):
         self.lifetimekWh = kwh
-        # Publish Lifetime kWh Value via Status modules
-        for module in self.master.getModulesByType("Status"):
-            module["ref"].setStatus(
-                self.TWCID, "lifetime_kwh", "lifetimekWh", self.lifetimekWh, "kWh"
-            )
+        self._publishStatus("lifetime_kwh", "lifetimekWh", self.lifetimekWh, "kWh")
 
     def setVoltage(self, pa, pb, pc):
         self.voltsPhaseA = pa
@@ -1160,25 +1210,21 @@ class TWCSlave:
         self.voltsPhaseC = pc
         # Publish phase 1, 2 and 3 values via Status modules
         for phase in ("A", "B", "C"):
-            for module in self.master.getModulesByType("Status"):
-                module["ref"].setStatus(
-                    self.TWCID,
-                    "voltage_phase_" + phase.lower(),
-                    "voltagePhase" + phase,
-                    getattr(self, "voltsPhase" + phase, 0),
-                    "V",
-                )
+            self._publishStatus(
+                "voltage_phase_" + phase.lower(),
+                "voltagePhase" + phase,
+                getattr(self, "voltsPhase" + phase, 0),
+                "V",
+            )
         self.refreshingChargerLoadStatus()
 
     def refreshingChargerLoadStatus(self):
-        for module in self.master.getModulesByType("Status"):
-            module["ref"].setStatus(
-                self.TWCID,
-                "charger_load_w",
-                "chargerLoadInW",
-                int(self.getCurrentChargerLoad()),
-                "W",
-            )
+        self._publishStatus(
+            "charger_load_w",
+            "chargerLoadInW",
+            int(self.getCurrentChargerLoad()),
+            "W",
+        )
 
     def getCurrentChargerLoad(self):
         return self.master.convertAmpsToWatts(

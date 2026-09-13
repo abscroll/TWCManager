@@ -1,8 +1,9 @@
 import logging
 import requests
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U000026a1 OpenHab")
+logger = LoggerFactory.get_logger("OpenHab", "EMS")
 
 
 class OpenHab:
@@ -34,7 +35,7 @@ class OpenHab:
         except KeyError:
             self.configConfig = {}
         try:
-            self.configOpenHab = master.config["sources"]["openHAB"]
+            self.configOpenHab = master.config.get("sources", {})["openHAB"]
         except KeyError:
             self.configOpenHab = {}
         self.status = self.configOpenHab.get("enabled", False)

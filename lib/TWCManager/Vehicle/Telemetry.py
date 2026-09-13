@@ -2,8 +2,9 @@ import logging
 import paho.mqtt.client as mqtt
 import threading
 import time
+from TWCManager.Logging.LoggerFactory import LoggerFactory
 
-logger = logging.getLogger("\U0001f697 Telemetry")
+logger = LoggerFactory.get_logger("Telemetry", "Vehicle")
 
 
 class TelmetryBase:
@@ -109,8 +110,10 @@ class TelmetryBase:
         logger.log(logging.INFO5, "MQTT Connected.")
         # No default subscriptions, should be handled by child class
 
-    def mqttDisconnect(self, client, userdata, flags, rc, properties=None):
-        if rc != 0:
+    def mqttDisconnect(
+        self, client, userdata, disconnect_flags, reason_code, properties=None
+    ):
+        if reason_code != 0:
             logger.log(
                 logging.INFO5, "MQTT Disconnected. Should reconnect automatically."
             )
