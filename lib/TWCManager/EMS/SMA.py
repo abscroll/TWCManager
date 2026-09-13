@@ -1,161 +1,100 @@
-import logging
-import requests
-import time
 import asyncio
+import logging
+import math
+import time
 
 import aiohttp
-
 import pysma
 
-
+try:
+    from pysma.sma_webconnect import SMAWebConnect
+except ImportError:
+    SMAWebConnect = None
 
 logger = logging.getLogger(__name__.rsplit(".")[-1])
+SENSOR_NAMES = ("grid_power", "metering_power_supplied", "metering_power_absorbed")
+
 
 class SMA:
-
-    # SMA EMS Module
-    # Fetches Consumption and Generation details from SMA WebConnect
-
-    cacheTime = 10  # in seconds
-    config = None
-    configConfig = None
-    configSMA = None
-    consumedW = 0
-    fetchFailed = False
-    generatedW = 0
-    lastFetch = 0
-    master = None
-    status = False
-    url = None
-    user = None
-    password = None
-    sma = None
-    sensors = None
+    """Read SMA WebConnect using either pysma 0.7 or 1.x."""
 
     def __init__(self, master):
         self.master = master
         self.config = master.config
-        try:
-            self.configConfig = master.config["config"]
-        except KeyError:
-            self.configConfig = {}
-        try:
-            self.configSMA = master.config["sources"]["SMA"]
-        except KeyError:
-            self.configSMA = {}
-        self.status = self.configSMA.get("enabled", False)
-        self.url = self.configSMA.get("url", None)
+        self.configSMA = self.config.get("sources", {}).get("SMA", {})
+        self.url = self.configSMA.get("url")
         self.user = self.configSMA.get("user", "user")
-        self.password = self.configSMA.get("password", None)
-
-        # Unload if this module is disabled or misconfigured
-        if (not self.status) or (not self.url) or (not self.user) or (not
-        self.password):
+        self.password = self.configSMA.get("password")
+        self.status = bool(self.configSMA.get("enabled", False) and self.url
+                           and self.user and self.password)
+        self.cacheTime = max(1, float(self.configSMA.get("cacheTime", 10)))
+        self.timeout = max(1, float(self.configSMA.get("timeout", 30)))
+        self.generatedW = self.consumedW = 0
+        self.lastFetch = 0
+        self._lastAttempt = None
+        self.fetchFailed = False
+        self.sensors = None
+        if not self.status:
             self.master.releaseModule("lib.TWCManager.EMS", "SMA")
-            return None
 
     def getConsumption(self):
-
-        if not self.status:
-            logger.debug("SMA EMS Module Disabled. Skipping getConsumption")
-            return 0
-
-        # Perform updates if necessary
-        self.update()
-
-        # Return consumption value
+        if self.status:
+            self.update()
         return self.consumedW
 
     def getGeneration(self):
-
-        if not self.status:
-            logger.debug("SMA EMS Module Disabled. Skipping getGeneration")
-            return 0
-
-        # Perform updates if necessary
-        self.update()
-
-        # Return generation value
+        if self.status:
+            self.update()
         return self.generatedW
 
     async def getSensors(self):
-
         async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False)
+            connector=aiohttp.TCPConnector(
+                ssl=self.configSMA.get("verifySSL", False)
+            ),
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as session:
-            self.fetchFailed = False
-            self.sma = pysma.SMA(session, self.url,
-            password=self.password, group=self.user)
-
+            client_class = SMAWebConnect or pysma.SMA
+            client = client_class(session, self.url, password=self.password,
+                                  group=self.user)
+            await client.new_session()
             try:
-                await self.sma.new_session()
-            except pysma.exceptions.SmaAuthenticationException:
-                logger.warning("Authentication failed!")
-                self.fetchFailed = True
-                return
-            except pysma.exceptions.SmaConnectionException:
-                logger.warning("Unable to connect to device at %s",
-                self.url)
-                self.fetchFailed = True
-                return
-
-            # We should not get any exceptions, but if we do we will close the session.
-            try:
-                self.sensors = pysma.Sensors()
-                self.sensors.add(pysma.definitions.grid_power)
-                self.sensors.add(pysma.definitions.metering_power_supplied)
-                self.sensors.add(pysma.definitions.metering_power_absorbed)
-                await self.sma.read(self.sensors)
-            except:
-                logger.warning("Sensor request failed!")
-                self.fetchFailed = True
+                if SMAWebConnect is not None:
+                    sensors = await client.get_sensors()
+                    for sensor in sensors:
+                        sensor.enabled = sensor.name in SENSOR_NAMES
+                else:
+                    sensors = pysma.Sensors()
+                    for name in SENSOR_NAMES:
+                        sensors.add(getattr(pysma.definitions, name))
+                await client.read(sensors)
+                return sensors
             finally:
-                logger.info("Closing Session...")
-                await self.sma.close_session()
+                await client.close_session()
 
+    async def _fetch(self):
+        return await asyncio.wait_for(self.getSensors(), timeout=self.timeout)
 
     def update(self):
-        # Update function - determine if an update is required
-
-        if (int(time.time()) - self.lastFetch) > self.cacheTime:
-            # Cache has expired. Fetch values from SMA
-            asyncio.run(self.getSensors())
-
-            for sen in self.sensors:
-                if sen.value is None:
-                    logger.debug("{:>25}".format(sen.name))
-                else:
-                    logger.debug("{:>25}{:>15} {}".format(sen.name, str(sen.value), sen.unit))
-
-            if self.fetchFailed is not True:
-                if self.sensors["grid_power"].value is not None:
-                    self.generatedW = self.sensors["grid_power"].value
-                    logger.debug("SMA getGeneration returns " + str(self.generatedW))
-                    if self.sensors["metering_power_supplied"].value is not None and self.sensors["metering_power_absorbed"].value is not None:
-                        if self.sensors["metering_power_supplied"].value > self.sensors["metering_power_absorbed"].value:
-                            self.consumedW = self.sensors["grid_power"].value - self.sensors["metering_power_supplied"].value
-                            logger.debug("SMA getConsumption returns " + str(self.consumedW) + ": generation " + str(self.sensors["grid_power"].value) + " - given to grid "  + str(self.sensors["metering_power_supplied"].value))
-                        else:
-                            self.consumedW = self.sensors["grid_power"].value + self.sensors["metering_power_absorbed"].value
-                            logger.debug("SMA getConsumption returns " + str(self.consumedW) + ": generation " + str(self.sensors["grid_power"].value) + " + absorbed from grid "  + str(self.sensors["metering_power_absorbed"].value))
-                    else:
-                        logger.debug(
-                            "SMA getConsumption fetch failed, using cached values"
-                        )
-                else:
-                    logger.debug(
-                        "SMA getGeneration data fetch failed, using cached values"
-                    )
-            else:
-                logger.debug(
-                    "SMA data fetch failed, using cached values"
-                )
-
-            # Update last fetch time
-            if self.fetchFailed is not True:
-                self.lastFetch = int(time.time())
-
-            return True
-        else:
-            # Cache time has not elapsed since last fetch, serve from cache.
+        now = time.monotonic()
+        if not self.status or (self._lastAttempt is not None
+                               and now - self._lastAttempt < self.cacheTime):
             return False
+        self._lastAttempt = now
+        try:
+            sensors = asyncio.run(self._fetch())
+            values = [float(sensors[name].value) for name in SENSOR_NAMES]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("Non-finite SMA reading")
+            generation, supplied, absorbed = values
+            # Preserve the fork's import/export calculation.
+            consumption = generation - supplied if supplied > absorbed else generation + absorbed
+        except Exception as error:
+            self.fetchFailed = True
+            logger.warning("SMA poll failed (%s); retaining cached readings", type(error).__name__)
+            return False
+        self.sensors = sensors
+        self.generatedW, self.consumedW = generation, consumption
+        self.fetchFailed = False
+        self.lastFetch = time.time()
+        return True
