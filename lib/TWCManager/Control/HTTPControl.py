@@ -746,7 +746,8 @@ def CreateHTTPHandlerClass(master):
                         return
                     receiver = bytes.fromhex(target)
                     if not any(
-                        bytes(slave.TWCID) == receiver for slave in master.getSlaveTWCs()
+                        bytes(slave.TWCID) == receiver
+                        for slave in master.getSlaveTWCs()
                     ):
                         self.send_response(404)
                         self.end_headers()

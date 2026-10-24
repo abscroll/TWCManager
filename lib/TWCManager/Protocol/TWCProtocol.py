@@ -39,7 +39,9 @@ class TWCProtocol:
                 sender.encode("latin1") if isinstance(sender, str) else bytes(sender)
             )
             receiver = (
-                receiver.encode("latin1") if isinstance(receiver, str) else bytes(receiver)
+                receiver.encode("latin1")
+                if isinstance(receiver, str)
+                else bytes(receiver)
             )
             if len(sender) != 2 or len(receiver) != 2:
                 raise ValueError("TWC IDs must contain exactly two bytes")
