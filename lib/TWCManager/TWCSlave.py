@@ -70,8 +70,6 @@ class TWCSlave:
     currentVIN = ""
     lastVIN = ""
 
-    vehicleModule = None
-
     def __init__(self, TWCID, maxAmps, config, master):
         self.config = config
         self.configConfig = self.config.get("config", {})
@@ -80,6 +78,10 @@ class TWCSlave:
         self.maxAmps = maxAmps
         self.APIcontrol = False
         self.vehicleRateRaised = False
+        # Bumped whenever vehicleRateRaised is reset, so a raise request that
+        # completes on the vehicle worker after control moved elsewhere
+        # can't set the flag back.
+        self._vehicleRateRaiseGen = 0
         self.__vehicleRateRaiseAttemptTime = 0
 
         self.wiringMaxAmps = self.configConfig.get("wiringMaxAmpsPerTWC", 6)
@@ -87,29 +89,31 @@ class TWCSlave:
             "useFlexAmpsToStartCharge", False
         )
         self.startStopDelay = self.configConfig.get("startStopDelay", 60)
-        self.vehicleModule = self.get_vehicle_module()
 
-    def get_vehicle_module(self):
-        # Try to use VehiclePriority proxy for fallback logic
-        vehiclePriority = self.master.getModuleByName("VehiclePriority")
-        if vehiclePriority:
-            return vehiclePriority
+    def _queueChargeRate(self, amps, callback=None):
+        # Vehicle commands can take minutes over BLE; hand them to the
+        # vehicle worker so this (main, serial) thread keeps running.
+        self.master.queue_vehicle_command(
+            {
+                "cmd": "setChargeRate",
+                "amps": int(amps),
+                "vehicle": self.getLastVehicle(),
+            },
+            callback,
+        )
 
-        # Fallback to direct module selection if VehiclePriority not available
-        carHass = self.master.getModuleByName("HomeAssistant")
-        if carHass:
-            return carHass
+    def _requestVehicleRateRaise(self):
+        gen = self._vehicleRateRaiseGen
 
-        carble = self.master.getModuleByName("TeslaBLE")
-        if carble:
-            return carble
+        def done(result):
+            if result is not False and gen == self._vehicleRateRaiseGen:
+                self.vehicleRateRaised = True
 
-        carapi = self.master.getModuleByName("TeslaAPI")
-        if carapi:
-            return carapi
+        self._queueChargeRate(self.wiringMaxAmps, done)
 
-        logger.error("No vehicle module enabled")
-        return None
+    def _resetVehicleRateRaised(self):
+        self.vehicleRateRaised = False
+        self._vehicleRateRaiseGen += 1
 
     def print_status(self, heartbeatData):
         try:
@@ -554,7 +558,7 @@ class TWCSlave:
                         + str(self.reportedAmpsActual)
                         + " < 4"
                     )
-                    self.master.cancelStopCarsCharging()
+                    self.master.cancelStopCarsCharging(self.currentVIN)
                 else:
                     # Car is trying to charge, so stop it via car API.
                     # car_api_charge() will prevent telling the car to start or stop
@@ -690,10 +694,8 @@ class TWCSlave:
         if yesterday < 0:
             yesterday += 7
 
-        # Determine our charging policy. This is the policy engine of the
-        # TWCManager application. Using defined rules, we can determine how
-        # we charge.
-        self.master.getModuleByName("Policy").setChargingPerPolicy()
+        # Charging policy is evaluated on the Policy module's own thread;
+        # here we only read its results (getMaxAmpsToDivideAmongSlaves etc.).
 
         # Determine how many cars are charging and how many amps they're using
         numCarsCharging = self.master.num_cars_charging_now()
@@ -863,7 +865,7 @@ class TWCSlave:
             # Control is given to the Tesla API to control Charge Rate
             # We offer the maximum wiring amps from the TWC, and ask the API to control charge rate
             self.APIcontrol = True
-            self.vehicleRateRaised = False
+            self._resetVehicleRateRaised()
             self.__vehicleRateRaiseAttemptTime = 0
 
             # Call the Tesla API to set the charge rate for vehicle connected to this TWC
@@ -884,12 +886,7 @@ class TWCSlave:
                 self.__lastAPIAmpsRepeat = 0
                 self.__lastAPIAmpsValue = int(desiredAmpsOffered)
 
-                # Determine vehicle to control
-                targetVehicle = (
-                    None if self.getLastVehicle() is None else self.getLastVehicle()
-                )
-
-                self.vehicleModule.setChargeRate(int(desiredAmpsOffered), targetVehicle)
+                self._queueChargeRate(desiredAmpsOffered)
 
             desiredAmpsOffered = self.wiringMaxAmps
 
@@ -902,12 +899,9 @@ class TWCSlave:
             if not self.vehicleRateRaised and (
                 now - self.__vehicleRateRaiseAttemptTime >= 60
             ):
+                # The 60s window also stops re-requesting while one is queued.
                 self.__vehicleRateRaiseAttemptTime = now
-                result = self.vehicleModule.setChargeRate(
-                    self.wiringMaxAmps, self.getLastVehicle()
-                )
-                if result is not False:
-                    self.vehicleRateRaised = True
+                self._requestVehicleRateRaise()
             self.APIcontrol = False
 
             # We can tell the TWC how much power to use in 0.01A increments, but
@@ -1068,12 +1062,21 @@ class TWCSlave:
         desiredAmpsOffered = self.set_last_amps_offered(desiredAmpsOffered)
 
         if desiredAmpsOffered > 0:
-            self.master.cancelStopCarsCharging()
+            self.master.cancelStopCarsCharging(self.currentVIN)
 
         # See notes in send_slave_heartbeat() for details on how we transmit
         # desiredAmpsOffered and the meaning of the code in
         # self.masterHeartbeatData[0].
-        #
+        self.masterHeartbeatData = self._amps_heartbeat(desiredAmpsOffered)
+
+        if len(self.master.getMasterHeartbeatOverride()) >= 7:
+            self.masterHeartbeatData = self.master.getMasterHeartbeatOverride()
+
+        if logger.getEffectiveLevel() <= logging.INFO:
+            self.print_status(heartbeatData)
+
+    def _amps_heartbeat(self, desiredAmpsOffered):
+        """Return the 9-byte master heartbeat payload for this slave."""
         # Rather than only sending desiredAmpsOffered when slave is sending code
         # 04 or 08, it seems to work better to send desiredAmpsOffered whenever
         # it does not equal self.reportedAmpsMax reported by the slave TWC.
@@ -1094,9 +1097,20 @@ class TWCSlave:
         # desiredAmpsOffered == 0. In that case, slave's response should always
         # look like this:
         #   S 032e 0.25/0.00A: 03 0000 0019 0000 M: 05 0000 0000 0000
-        if self.reportedAmpsMax != desiredAmpsOffered or desiredAmpsOffered == 0:
+        #
+        # State 08 ("starting to charge") needs the offer resent even when the
+        # slave's reported max already matches. A slave seen idle in state 03
+        # with the offer already at 47A went to 08 reporting 06.16/47.00A and
+        # stayed there at 6A until a mismatch was forced. Only 08 is included:
+        # resending every heartbeat in a long-lived state (e.g. 04) risks the
+        # slave bouncing between states.
+        if (
+            self.reportedAmpsMax != desiredAmpsOffered
+            or desiredAmpsOffered == 0
+            or self.reportedState == 0x08
+        ):
             desiredHundredthsOfAmps = int(desiredAmpsOffered * 100)
-            self.masterHeartbeatData = bytearray(
+            return bytearray(
                 [
                     (0x09 if self.protocolVersion == 2 else 0x05),
                     (desiredHundredthsOfAmps >> 8) & 0xFF,
@@ -1110,15 +1124,7 @@ class TWCSlave:
                 ]
             )
         else:
-            self.masterHeartbeatData = bytearray(
-                [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-            )
-
-        if len(self.master.getMasterHeartbeatOverride()) >= 7:
-            self.masterHeartbeatData = self.master.getMasterHeartbeatOverride()
-
-        if logger.getEffectiveLevel() <= logging.INFO:
-            self.print_status(heartbeatData)
+            return bytearray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
 
     def set_last_amps_offered(self, desiredAmpsOffered):
         # self.lastAmpsOffered should only be changed using this sub.

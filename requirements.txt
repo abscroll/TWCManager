@@ -14,7 +14,7 @@ pyModbusTCP>=0.1.8
 pymysql
 pyserial>=3.4
 pysma>=0.6.6,<1; python_version < '3.12'
-pysma>=1.1.6,<2; python_version >= '3.12'
+pysma>=1.1.10,<2; python_version >= '3.12'
 PyJWT
 PyYAML
 requests>=2.25.2

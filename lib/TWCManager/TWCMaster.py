@@ -15,8 +15,14 @@ import random
 import requests
 import bisect
 from TWCManager.Logging.LoggerFactory import LoggerFactory
+from TWCManager.VehicleCommandQueue import VehicleCommandQueue
 
 logger = LoggerFactory.get_logger("Master", "Master")
+
+# Background task commands that are vehicle commands. They run on the
+# VehicleCommandQueue worker so slow BLE retries don't stall other
+# background work.
+VEHICLE_COMMANDS = frozenset(["charge", "applyChargeLimit"])
 
 
 class TWCMaster:
@@ -73,7 +79,7 @@ class TWCMaster:
     treatGenerationAsGridDelivery = False
     TWCID = None
     updateVersion = False
-    version = "1.3.4"
+    version = "1.4.0"
 
     # TWCs send a seemingly-random byte after their 2-byte TWC id in a number of
     # messages. I call this byte their "Sign" for lack of a better term. The byte
@@ -97,6 +103,9 @@ class TWCMaster:
         self.slaveTWCRoundRobin = []
         self.slaveTWCs = {}
         self.stats = {"moduleDispatch": {}, "moduleFailures": {}, "moduleSuccess": {}}
+        self.vehicleCommandQueue = VehicleCommandQueue(
+            self._resolveVehicleCommandModule
+        )
         self.settings = {
             "chargeNowAmps": 0,
             "chargeStopMode": "1",
@@ -154,8 +163,10 @@ class TWCMaster:
         else:
             return 0
 
-    def cancelStopCarsCharging(self):
-        self.delete_background_task({"cmd": "charge", "charge": False})
+    def cancelStopCarsCharging(self, vin=None):
+        # Charge commands go to the vehicle command queue, not the background
+        # task table, so a pending stop is cancelled there (closes #667).
+        self.vehicleCommandQueue.cancel_stop(vin)
 
     def checkForUpdates(self):
         # This function is used by the Web UI and later on will be used by the console to detect TWCManager Updates
@@ -535,9 +546,9 @@ class TWCMaster:
         remaining_watts = available_watts
         pending = sorted(wants_power, key=lambda e: e.maxPower)
 
-        for evse in pending:
-            if not pending:
-                break
+        # Iterate a copy: pending.remove() below would otherwise make the loop
+        # skip every other EVSE, leaving it with no setTargetPower() at all.
+        for evse in list(pending):
             fair_share = remaining_watts / len(pending)
 
             # Constrain by EVSE capacity
@@ -1095,10 +1106,34 @@ class TWCMaster:
                 self.settings[key] = value
 
         # Step 2 - Send settings to other modules
+        # Migration and restore run whether or not token sync is on. The
+        # sync source's startup sync has already run (every module is
+        # registered by now); restoreSlot keeps its token over a saved
+        # synced one, while a saved pasted or login token replaces it.
         carapi = self.getModuleByName("TeslaAPI")
-        carapi.setCarApiBearerToken(self.settings.get("carApiBearerToken", ""))
-        carapi.setCarApiRefreshToken(self.settings.get("carApiRefreshToken", ""))
-        carapi.setCarApiTokenExpireTime(self.settings.get("carApiTokenExpireTime", ""))
+        # Configured, not tokenSyncEnabled(): sync turns itself off when
+        # the TeslaMate database is unreachable at startup, and a token it
+        # saved must still count as synced.
+        teslamateConfig = self.config.get("vehicle", {}).get("TeslaMate", {}) or {}
+        syncConfigured = bool(teslamateConfig.get("syncTokens", False))
+        if carapi.migrateSavedTokens(self.settings, syncConfigured):
+            # Writes the migrated keys, so a dropped TeslaMate refresh token
+            # leaves settings.json too.
+            self.queue_background_task({"cmd": "saveSettings"})
+        carapi.restoreSlot(
+            carapi.fleetSlot,
+            self.settings.get("carApiBearerToken", ""),
+            self.settings.get("carApiRefreshToken", ""),
+            self.settings.get("carApiTokenExpireTime", ""),
+            self.settings.get("carApiTokenSource") or "pasted",
+        )
+        carapi.restoreSlot(
+            carapi.ownerSlot,
+            self.settings.get("ownerApiBearerToken", ""),
+            self.settings.get("ownerApiRefreshToken", ""),
+            self.settings.get("ownerApiTokenExpireTime", ""),
+            self.settings.get("ownerApiTokenSource") or "pasted",
+        )
 
         # We start with vehicles, but this should be templated in future for all modules to both remove the above logic,
         # and to push settings logic out to the individual modules
@@ -1243,6 +1278,10 @@ class TWCMaster:
             )
             return
 
+        if task["cmd"] in VEHICLE_COMMANDS:
+            self.queue_vehicle_command(task)
+            return
+
         self.getBackgroundTasksLock()
         try:
             if task["cmd"] in self.backgroundTasksCmds:
@@ -1261,6 +1300,20 @@ class TWCMaster:
 
         # Queue the task to be handled by background_tasks_thread.
         self.backgroundTasksQueue.put(task)
+
+    def queue_vehicle_command(self, task, callback=None):
+        # Hand a vehicle command to the vehicle command worker. Returns
+        # immediately; callback(result) runs on the worker when done.
+        self.vehicleCommandQueue.put(task, callback)
+
+    def _resolveVehicleCommandModule(self):
+        # Preference order: VehiclePriority (priority/fallback proxy), then
+        # HomeAssistant, TeslaBLE, TeslaAPI.
+        for name in ("VehiclePriority", "HomeAssistant", "TeslaBLE", "TeslaAPI"):
+            module = self.getModuleByName(name)
+            if module:
+                return module
+        return None
 
     def registerModule(self, module):
         # This function is used during module instantiation to either reference a
@@ -1476,9 +1529,14 @@ class TWCMaster:
 
         # Step 1 - Merge any config from other modules
         carapi = self.getModuleByName("TeslaAPI")
-        self.settings["carApiBearerToken"] = carapi.getCarApiBearerToken()
-        self.settings["carApiRefreshToken"] = carapi.getCarApiRefreshToken()
-        self.settings["carApiTokenExpireTime"] = carapi.getCarApiTokenExpireTime()
+        self.settings["carApiBearerToken"] = carapi.fleetSlot.accessToken
+        self.settings["carApiRefreshToken"] = carapi.fleetSlot.refreshToken
+        self.settings["carApiTokenExpireTime"] = carapi.fleetSlot.expireTime
+        self.settings["ownerApiBearerToken"] = carapi.ownerSlot.accessToken
+        self.settings["ownerApiRefreshToken"] = carapi.ownerSlot.refreshToken
+        self.settings["ownerApiTokenExpireTime"] = carapi.ownerSlot.expireTime
+        self.settings["carApiTokenSource"] = carapi.fleetSlot.source
+        self.settings["ownerApiTokenSource"] = carapi.ownerSlot.source
 
         # Step 2 - Write the settings dict to a JSON file atomically
         # Use temp file + rename to ensure atomic write and prevent corruption
@@ -1835,7 +1893,7 @@ class TWCMaster:
         # below
         stopMode = int(self.settings.get("chargeStopMode", 1))
         if stopMode == 1:
-            self.queue_background_task({"cmd": "charge", "charge": True})
+            self.queue_background_task({"cmd": "charge", "charge": True, "vin": vin})
             self.getModuleByName("Policy").clearOverride()
         elif stopMode == 2:
             self.settings["respondToSlaves"] = 1

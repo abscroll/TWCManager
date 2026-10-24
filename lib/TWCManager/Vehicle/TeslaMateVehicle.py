@@ -1,5 +1,6 @@
 import base64
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 from hashlib import sha256
 import logging
 import psycopg2
@@ -39,6 +40,17 @@ def fix_base64_padding(data):
 logger = LoggerFactory.get_logger("TeslaMate", "Vehicle")
 
 
+def parse_bool(payload):
+    """True or False for a "true"/"false" payload, else None (unknown): an
+    empty or odd payload must not read as unplugged."""
+    value = str(payload).strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return None
+
+
 class TeslaMateVehicle(TelmetryBase):
     __db_host = None
     __db_name = None
@@ -60,6 +72,7 @@ class TeslaMateVehicle(TelmetryBase):
         "charger_phases": ["phases", lambda a: int(a) if a else 0],
         "charger_voltage": ["voltage", lambda a: int(a)],
         "charging_state": ["chargingState", lambda a: str(a)],
+        "plugged_in": ["pluggedIn", parse_bool],
     }
 
     def __init__(self, master):
@@ -110,9 +123,16 @@ class TeslaMateVehicle(TelmetryBase):
             return None
 
         try:
-            # 1. Decode from Base64
+            # 1. Get the raw Cloak blob. psycopg2 returns TeslaMate's bytea
+            # columns as memoryview/bytes, already raw; only a text value
+            # needs Base64 decoding.
+            if isinstance(encrypted_data, (bytes, bytearray, memoryview)):
+                decoded_data = bytes(encrypted_data)
+            else:
+                decoded_data = None
             try:
-                decoded_data = base64.b64decode(encrypted_data)
+                if decoded_data is None:
+                    decoded_data = base64.b64decode(encrypted_data)
             except Exception as e:
                 logger.info(f"Base64 decode failed: {e}. Attempting to fix padding...")
                 try:
@@ -163,12 +183,18 @@ class TeslaMateVehicle(TelmetryBase):
             # 3. Derive the key by hashing the user-provided key with SHA-256
             key = sha256(self.encryption_key.encode("utf-8")).digest()
 
-            # 4. Decrypt using AES-256-GCM with the tag as AAD
+            # 4. Decrypt using AES-256-GCM. Cloak's AES.GCM cipher always
+            # authenticates the fixed AAD "AES256GCM", not the key tag;
+            # the key tag is kept as a fallback for any data written the
+            # other way.
             aesgcm = AESGCM(key)
             ciphertext_with_tag = ciphertext + ciphertag
-            decrypted_data = aesgcm.decrypt(
-                iv, ciphertext_with_tag, key_tag.encode("utf-8")
-            )
+            try:
+                decrypted_data = aesgcm.decrypt(iv, ciphertext_with_tag, b"AES256GCM")
+            except InvalidTag:
+                decrypted_data = aesgcm.decrypt(
+                    iv, ciphertext_with_tag, key_tag.encode("utf-8")
+                )
 
             return decrypted_data.decode("utf-8")
         except Exception as e:
@@ -178,13 +204,29 @@ class TeslaMateVehicle(TelmetryBase):
             )
             return None
 
+    # TeslaMate moved its tokens table into the "private" schema; older
+    # installs still have it in public. Try the current location first.
+    TOKEN_TABLES = ("private.tokens", "tokens")
+
+    def fetchLatestTokens(self, conn, cur):
+        for table in self.TOKEN_TABLES:
+            try:
+                cur.execute("SELECT access FROM " + table + " ORDER BY id DESC LIMIT 1")
+            except psycopg2.errors.UndefinedTable:
+                # A failed statement aborts the transaction; clear it
+                # before trying the next location.
+                conn.rollback()
+                continue
+            return cur.fetchone()
+        logger.error("No tokens table found in the TeslaMate database.")
+        return None
+
     def doSyncTokens(self, firstrun=False):
         # Connect to TeslaMate database and synchronize API tokens
 
         if self.__db_host and self.__db_name and self.__db_user and self.__db_pass:
             conn = None
             access_token = None
-            refresh_token = None
 
             try:
                 conn = psycopg2.connect(
@@ -209,34 +251,22 @@ class TeslaMateVehicle(TelmetryBase):
 
                 try:
                     # Query DB for latest access and refresh token
-                    cur.execute(
-                        "SELECT access, refresh FROM tokens ORDER BY id DESC LIMIT 1"
-                    )
+                    result = self.fetchLatestTokens(conn, cur)
 
-                    # Fetch result
-                    result = cur.fetchone()
+                    if result and result[0]:
+                        access_token = self.decrypt_data(result[0])
 
-                    if result:
-                        encrypted_access_token = result[0]
-                        encrypted_refresh_token = result[1]
-
-                        if encrypted_access_token and encrypted_refresh_token:
-                            access_token = self.decrypt_data(encrypted_access_token)
-                            refresh_token = self.decrypt_data(encrypted_refresh_token)
-
-                    if access_token and refresh_token:
-                        # Set Bearer and Refresh Tokens
+                    if access_token:
                         carapi = self.master.getModuleByName("TeslaAPI")
                         if carapi:
-                            # We don't want to refresh the token - let the source handle that.
-                            carapi.setCarApiTokenExpireTime(99999 * 99999 * 99999)
-                            carapi.setCarApiBearerToken(access_token)
-                            carapi.setCarApiRefreshToken(refresh_token)
-                            self.lastSync = time.time()
-                            logger.log(
-                                logging.INFO,
-                                "Successfully synced tokens from TeslaMate database",
-                            )
+                            # Access token only: a synced token expires at
+                            # its own exp, and TeslaMate does the refreshing.
+                            if carapi.applySyncedToken(access_token) == "success":
+                                self.lastSync = time.time()
+                                logger.log(
+                                    logging.INFO,
+                                    "Successfully synced tokens from TeslaMate database",
+                                )
                         else:
                             logger.error("TeslaAPI module not found")
                     else:

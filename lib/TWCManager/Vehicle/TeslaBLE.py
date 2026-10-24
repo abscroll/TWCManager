@@ -3,6 +3,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
+import functools
 import json
 import logging
 import os
@@ -10,10 +11,28 @@ from pathlib import Path
 import signal
 import shutil
 import subprocess
+import threading
 import time
 from TWCManager.Logging.LoggerFactory import LoggerFactory
 
 logger = LoggerFactory.get_logger("TeslaBLE", "Vehicle")
+
+
+def _serialized(method):
+    """Hold the instance's BLE lock for the whole call.
+
+    Every tesla-control invocation writes key material to the shared
+    pipeName path, runs, and unlinks it. Overlapping invocations delete each
+    other's key file and contend for the adapter, so each "write key -> run ->
+    unlink" unit must run alone, whatever thread it is called from.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._bleLock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class BLECircuitBreaker:
@@ -77,6 +96,7 @@ class TeslaBLE:
     pipeOpen = False  # Track pipe state
 
     def __init__(self, master):
+        self._bleLock = threading.Lock()
         self.master = master
         try:
             self.config = self.master.config
@@ -386,6 +406,7 @@ class TeslaBLE:
         )
         return False
 
+    @_serialized
     def peerWithVehicle(self, vin):
         """
         Pair with a vehicle using BLE key exchange.
@@ -420,9 +441,6 @@ class TeslaBLE:
                 "owner",
                 "cloud_key",
             ]
-
-            if self.isDocker():
-                command_string.insert(0, "nsenter --net=/rootns/net ")
 
             # Use improved timeout handling (pairing takes longer)
             stdout, stderr, return_code = self._run_command_with_timeout(
@@ -464,6 +482,7 @@ class TeslaBLE:
             vin = vin.VIN
         return self._execute_with_retry(self._sendCommand_internal, vin, command, args)
 
+    @_serialized
     def _sendCommand_internal(self, vin, command, args=None):
         """
         Internal sendCommand implementation (called by retry wrapper).
@@ -509,9 +528,6 @@ class TeslaBLE:
                 self.pipeName,
                 command,
             ]
-            if self.isDocker():
-                command_string.insert(0, "nsenter --net=/rootns/net ")
-
             if args:
                 command_string.append(str(args))
 
@@ -910,6 +926,7 @@ class TeslaBLE:
             return float(val.get("seconds", 0)) or None
         return None
 
+    @_serialized
     def _fetch_state_json(self, vin, state_type):
         """Run `tesla-control state STATE_TYPE` and return parsed JSON dict, or None."""
         if not self.binaryPath or not os.path.isfile(self.binaryPath):
@@ -929,9 +946,6 @@ class TeslaBLE:
             "state",
             state_type,
         ]
-        if self.isDocker():
-            command_string.insert(0, "nsenter --net=/rootns/net")
-
         try:
             stdout, stderr, return_code = self._run_command_with_timeout(
                 command_string, timeout=self.commandTimeout
@@ -1269,16 +1283,21 @@ class TeslaBLE:
         Args:
             command_string: List of command arguments
             timeout: Timeout in seconds
-            use_process_group: Whether to use process groups (for Docker compatibility)
+            use_process_group: Run it in its own process group, killed whole
+                on a timeout
 
         Returns:
             Tuple of (stdout, stderr, return_code) or (None, None, None) on timeout
         """
         try:
-            # Prepare preexec_fn for process group creation
+            if self.isDocker() and command_string[0] == self.binaryPath:
+                # tesla-control opens the adapter in the host's network
+                # namespace; each word is its own argument (no shell)
+                command_string = ["nsenter", "--net=/rootns/net"] + command_string
             preexec_fn = None
-            if use_process_group and not self.isDocker():
-                # Create new process group (only works on Unix, not in Docker)
+            if use_process_group:
+                # The timeout kills the child's whole group, which must not
+                # be TWCManager's own
                 preexec_fn = os.setsid
 
             logger.debug(

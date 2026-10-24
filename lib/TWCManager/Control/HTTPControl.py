@@ -1198,6 +1198,7 @@ def CreateHTTPHandlerClass(master):
                 {"route": "/settings", "tmpl": "settings.html.j2"},
                 {"route": "/settings/homeLocation", "error": "insecure"},
                 {"route": "/settings/save", "error": "insecure"},
+                {"route": "/teslaAccount/removeToken", "error": "insecure"},
                 {"route": "/teslaAccount/saveToken", "error": "insecure"},
                 {"rstart": "/teslaAccount", "tmpl": "main.html.j2"},
                 {"route": "/upgradePrompt", "tmpl": "upgradePrompt.html.j2"},
@@ -1214,11 +1215,10 @@ def CreateHTTPHandlerClass(master):
                 self.template = self.templateEnv.get_template("main.html.j2")
 
                 # Set some values that we use within the template
-                # The Tesla login form is hidden once we hold an API token.
+                # The Tesla login form is hidden once we hold a Fleet API
+                # token, so an Owner-only user can still log in.
                 teslaapi = master.getModuleByName("TeslaAPI")
-                self.apiAvailable = bool(
-                    teslaapi and teslaapi.getCarApiBearerToken() != ""
-                )
+                self.apiAvailable = bool(teslaapi and not teslaapi.fleetSlot.empty())
                 self.scheduledAmpsMax = master.getScheduledAmpsMax()
 
                 self.activeAction = master.getModuleByName(
@@ -1459,6 +1459,17 @@ def CreateHTTPHandlerClass(master):
 
                 self.send_response(302)
                 self.send_header("Location", "/teslaAccount/" + res)
+                self.end_headers()
+                self.wfile.write("".encode("utf-8"))
+                return
+
+            if self.url.path == "/teslaAccount/removeToken":
+                teslaapi = master.getModuleByName("TeslaAPI")
+                if teslaapi:
+                    teslaapi.removeToken(self.getFieldValue("slot"))
+
+                self.send_response(302)
+                self.send_header("Location", "/settings")
                 self.end_headers()
                 self.wfile.write("".encode("utf-8"))
                 return
@@ -1744,6 +1755,7 @@ def CreateHTTPHandlerClass(master):
             # This function will write the settings submitted from the settings
             # page to the settings dict, before triggering a write of the settings
             # to file
+            location = "/"
             for key in self.fields:
                 # If the key relates to the car API tokens, we need to pass these
                 # to the appropriate module, rather than directly updating the
@@ -1752,10 +1764,24 @@ def CreateHTTPHandlerClass(master):
                     key == "carApiBearerToken" or key == "carApiRefreshToken"
                 ) and self.getFieldValue(key) != "":
                     carapi = master.getModuleByName("TeslaAPI")
+                    result = "success"
                     if key == "carApiBearerToken":
-                        carapi.setCarApiBearerToken(self.getFieldValue(key))
-                    elif key == "carApiRefreshToken":
-                        carapi.setCarApiRefreshToken(self.getFieldValue(key))
+                        # Stored in the slot of its type, with the refresh
+                        # token if one was pasted too; otherwise the slot
+                        # keeps its refresh token.
+                        result = carapi.storeToken(
+                            self.getFieldValue(key),
+                            self.getFieldValue("carApiRefreshToken") or None,
+                            "pasted",
+                        )
+                    elif not self.getFieldValue("carApiBearerToken"):
+                        # Pasted on its own: replaces the tokens in the slot
+                        # of its type and refreshes at once. (With an access
+                        # token, it was stored with it above.)
+                        result = carapi.pasteRefreshToken(self.getFieldValue(key))
+                    if result != "success":
+                        # Say why on the page we redirect to.
+                        location = "/teslaAccount/" + result
 
                 else:
                     # Write setting to dictionary
@@ -1786,9 +1812,9 @@ def CreateHTTPHandlerClass(master):
             # Save Settings
             master.queue_background_task({"cmd": "saveSettings"})
 
-            # Redirect to the index page
+            # Redirect to the index page, or to the token sync notice
             self.send_response(302)
-            self.send_header("Location", "/")
+            self.send_header("Location", location)
             self.end_headers()
             self.wfile.write("".encode("utf-8"))
             return

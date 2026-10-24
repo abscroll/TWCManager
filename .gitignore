@@ -9,6 +9,7 @@ settings.json
 .DS_Store
 .venv/
 .venv-server/
+.venv-upstream/
 /config.json
 /runtime/
 # Root-level markdown files (scratch notes, plans, CLAUDE.md, etc.)

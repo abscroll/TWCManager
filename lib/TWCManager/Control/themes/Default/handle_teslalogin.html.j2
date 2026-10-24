@@ -1,12 +1,24 @@
 {% if url.path == "/teslaAccount/success" %}
   <font color="blue">
-    <b>Success, your Tesla FleetAPI tokens have been stored.</b>
+    <b>Success, your Tesla API tokens have been stored.</b>
   </font>
+  {% set carapi = master.getModuleByName("TeslaAPI") %}
+  {% if carapi and carapi.ownerTokenOnly %}
+  <p>This is an Owner API token: TWCManager can read your vehicle state with
+     it. Tesla accepts vehicle commands with it only for vehicles it reports
+     as not needing signed commands (<code>command_signing</code> "off");
+     TWCManager checks each vehicle and treats the rest as read-only. The
+     Vehicle Command proxy only takes Fleet API tokens. To <b>drive
+     charging</b> (start/stop/rate-limit) on the other vehicles, use the
+     TeslaBLE module, which sends commands to the car over Bluetooth. See the
+     <a href="https://github.com/ngardiner/TWCManager/blob/main/docs/modules/Vehicle_TeslaBLE.md" target="_blank">TeslaBLE</a> docs.</p>
+  {% else %}
   <p>TWCManager can now read your vehicle state. To <b>drive charging</b>
      (start/stop/rate-limit), you also need the Tesla Vehicle Command proxy
      (set <code>teslaProxy</code>) or the TeslaBLE module - Tesla's REST charge
      commands now require the Vehicle Command Protocol. See the
      <a href="https://github.com/ngardiner/TWCManager/blob/main/docs/modules/Vehicle_TeslaAPI.md#driving-charging-proxy-or-ble" target="_blank">Driving charging</a> docs.</p>
+  {% endif %}
 {% elif url.path == "/teslaAccount/state_mismatch" %}
   <font color='red'>
     <b>Login security check failed (state mismatch). This usually happens if the
@@ -21,6 +33,34 @@
 {% elif url.path == "/teslaAccount/response_no_token" %}
   <font color='red'>
     <b>The Tesla API did not return an access token. Please try again.</b>
+  </font>
+{% elif url.path == "/teslaAccount/token_sync" %}
+  <font color='red'>
+    <b>TeslaMate token sync manages the token slot this token belongs to, so
+       it was not stored. To replace TeslaMate's token, remove it on the
+       Settings page, or turn off syncTokens in the TeslaMate module's
+       config.</b>
+  </font>
+{% elif url.path == "/teslaAccount/unknown_type" %}
+  <font color='red'>
+    <b>TWCManager could not recognise this token as an Owner API or Fleet API
+       token. Nothing was stored.</b>
+  </font>
+{% elif url.path == "/teslaAccount/mismatched_types" %}
+  <font color='red'>
+    <b>The access token and refresh token are for different Tesla APIs (one
+       Owner API, one Fleet API), so neither was stored. Paste them
+       separately, or paste a matching pair.</b>
+  </font>
+{% elif url.path == "/teslaAccount/token_rejected" %}
+  <font color='red'>
+    <b>Tesla rejected the token you supplied. Your previous Tesla API tokens
+       were kept.</b>
+  </font>
+{% elif url.path == "/teslaAccount/unreachable" %}
+  <font color='red'>
+    <b>TWCManager could not reach Tesla to check the token you supplied. The
+       token has been stored, and TWCManager will retry.</b>
   </font>
 {% elif url.path == "/teslaAccount/error" %}
   <font color='red'>
@@ -37,7 +77,8 @@
   </font>
 {% endif %}
 
-{% if not master.tokenSyncEnabled()
+{% set carapi = master.getModuleByName("TeslaAPI") %}
+{% if carapi and not carapi.syncedSlotLocked(carapi.fleetSlot)
       and url.path != "/teslaAccount/success" %}
       <!-- Show the login form whenever we don't already hold an API token -->
       {% if not apiAvailable %}

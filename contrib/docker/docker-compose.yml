@@ -4,6 +4,9 @@ services:
   twcmanager:
     image: twcmanager/twcmanager:latest
     restart: always
+    # Shutdown drains stop-charging commands for up to 60 s and finishes
+    # within 80 s; Docker's 10 s default would SIGKILL it mid-drain.
+    stop_grace_period: 90s
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
       - "/dev/ttyUSB0:/dev/ttyUSB0"
@@ -24,3 +27,4 @@ services:
       - CAP_NET_ADMIN  # Required for managing network interfaces (Bluetooth uses these)
       - CAP_NET_RAW    # Required for raw network access (Bluetooth uses this)
       - CAP_SYS_ADMIN  # Needed for Bluetooth HCI access
+      - CAP_SYS_PTRACE  # nsenter opens the host's network namespace through /proc/1/ns
