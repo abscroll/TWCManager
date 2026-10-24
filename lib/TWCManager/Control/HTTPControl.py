@@ -735,6 +735,30 @@ def CreateHTTPHandlerClass(master):
                     return
 
                 packet = {"Command": command_name}
+                if command_name == "GetFirmwareVersion" and "TWCID" in data:
+                    target = data["TWCID"]
+                    if not isinstance(target, str) or not re.fullmatch(
+                        r"[0-9a-fA-F]{4}", target
+                    ):
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"TWCID must be four hexadecimal characters")
+                        return
+                    receiver = bytes.fromhex(target)
+                    if not any(
+                        bytes(slave.TWCID) == receiver for slave in master.getSlaveTWCs()
+                    ):
+                        self.send_response(404)
+                        self.end_headers()
+                        self.wfile.write(b"Unknown charger TWCID")
+                        return
+                    packet["RecieverID"] = receiver
+
+                if command_name == "GetFirmwareVersion" and not master.getSlaveTWCs():
+                    self.send_response(409)
+                    self.end_headers()
+                    self.wfile.write(b"No chargers connected")
+                    return
                 if command_name == "Custom":
                     custom_cmd = data.get("customCommand", "")
                     if not custom_cmd or not isinstance(custom_cmd, str):

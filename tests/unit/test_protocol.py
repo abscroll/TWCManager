@@ -16,6 +16,7 @@ class TestProtocolMessageCreation:
         """Create a mock master object."""
         master = Mock()
         master.masterTWCID = "AB"
+        master.TWCID = bytearray(b"AB")
         master.protocolVersion = 2
         slave = Mock()
         slave.TWCID = "CD"

@@ -24,6 +24,31 @@ class TWCProtocol:
         classname = self.__class__.__name__
 
     def createMessage(self, packet):
+        if packet.get("Command") == "GetFirmwareVersion":
+            # IDs on the wire are two bytes, not the printable representation
+            # of a bytearray. Keep this read-only query separate from legacy
+            # command defaults and allow an explicit destination.
+            sender = packet.get("SenderID", self.master.TWCID)
+            receiver = packet.get("RecieverID")
+            if receiver is None:
+                slaves = self.master.getSlaveTWCs()
+                if not slaves:
+                    raise ValueError("No chargers connected")
+                receiver = slaves[0].TWCID
+            sender = (
+                sender.encode("latin1") if isinstance(sender, str) else bytes(sender)
+            )
+            receiver = (
+                receiver.encode("latin1") if isinstance(receiver, str) else bytes(receiver)
+            )
+            if len(sender) != 2 or len(receiver) != 2:
+                raise ValueError("TWC IDs must contain exactly two bytes")
+            msg = bytearray(b"\xfb\x1b" + sender + receiver)
+            msg += bytearray(7)
+            if self.master.protocolVersion == 2:
+                msg += bytearray(b"\x00\x00")
+            return msg
+
         # We take some steps to be as autonomous as possible. One of these
         # steps is to automatically fill in fields where we can likely
         # determine the correct value
@@ -62,18 +87,6 @@ class TWCProtocol:
 
             msg = (
                 packet["CustomCommand"]
-                + packet["SenderID"]
-                + packet["RecieverID"]
-                + bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
-            )
-            if self.master.protocolVersion == 2:
-                msg += bytearray(b"\x00\x00")
-
-            return msg
-
-        elif packet["Command"] == "GetFirmwareVersion":
-            msg = (
-                bytearray(b"\xfb\x1b")
                 + packet["SenderID"]
                 + packet["RecieverID"]
                 + bytearray(b"\x00\x00\xa0\x00\x00\x00\x00")
