@@ -2,7 +2,7 @@
 
 This document logs the changes per release of TWCManager.
 
-## v1.4.0 - Upcoming
+## v1.4.0 - 2026-10-25
 
 * Features
     * (@MikeBishop) - Apply charge limit over BLE
@@ -80,6 +80,11 @@ This document logs the changes per release of TWCManager.
     * (@tmark00) - Fix: A null Fleet API voltage or current while a car is unplugged no longer stops TWC heartbeats (closes #713)
     * Fix: Serialize Tesla token refreshes, so two threads no longer spend the same single-use refresh token and lose both tokens (closes #690)
     * Fix: Fronius read timeouts are logged and skipped instead of raising a traceback
+    * Fix: An HTTP POST without a Content-Length header no longer crashes the request handler (closes #666)
+    * Fix: A 401 on a Tesla API vehicle command refreshes an expired token and retries once, and clears a dead token so commands fall back to BLE (closes #689)
+    * (@tmark00) - Fix: The power distributor budgets with the measured TWC voltage instead of defaultVoltage, so a TWC is no longer offered more current than the policy asks for (closes #715)
+* Fix: A Gen2 TWC that reports no voltage falls back to defaultVoltage on every configured phase, not just phase A
+* Fix: The vehicle page shows BLE pairing status, and tells you to tap your key card after a pairing request
 
 ## v1.3.4 - 2026-04-24
 * Features
