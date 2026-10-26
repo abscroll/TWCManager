@@ -112,3 +112,23 @@ crw-rw---- 1 root dialout 188, 2 Jun 16 17:34 /dev/ttyUSB2
 lrwxrwxrwx 1 root root         7 Jun 16 17:34 /dev/USBTWC -> ttyUSB2
 ```
 Now you can use in `config.json` the new name `"port": "/dev/USBTWC"`
+
+## Optional Gen2 shared-current rounding
+
+Set `config.roundUpSharedCurrent` to the JSON boolean `true` to round fractional
+measured shared headroom up to the next whole amp in the legacy Gen2 allocator.
+It defaults to `false`; omission retains downward rounding. For example, with a
+32 A shared limit and a peer reporting 16.42 A, 15.58 A of remaining headroom is
+rounded to a 16 A offer instead of 15 A. The extra allowance from this rounding
+is less than 1 A and does not raise the requested fair share or per-charger limit.
+Existing minimum-start and spike behavior is unchanged. Centralized allocation
+does not use this option.
+
+This explicitly permits a fractional excess over the measured shared limit;
+enable it only where that tolerance is acceptable for the installation. Keep
+`wiringMaxAmpsAllTWCs` at the installation's nominal limit. Changing this
+configuration requires restarting TWCManager.
+
+```json
+{"config": {"wiringMaxAmpsAllTWCs": 32, "roundUpSharedCurrent": true}}
+```

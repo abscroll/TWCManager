@@ -152,3 +152,77 @@ def test_mixed_controllable_api_vehicle_retains_central_distributor():
     master.distributeEVSEPower()
     assert active._evseTargetAmps is not None
     api.setTargetPower.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "flag,expected", [(None, 15), (False, 15), (True, 16), ("false", 15)]
+)
+def test_optional_headroom_rounding_through_real_heartbeats(flag, expected):
+    master, (first, second) = setup_pair()
+    if flag is not None:
+        master.config["config"]["roundUpSharedCurrent"] = flag
+    first.reportedAmpsActual = 16.42
+    first.isCharging = True
+    second.isCharging = True
+    second.lastAmpsOffered = 14
+    master.distributeEVSEPower()
+    with patch("TWCManager.TWCSlave.time.time", return_value=1000):
+        assert heartbeat(second, 1, 14.85) == expected
+
+
+@pytest.mark.parametrize(
+    "peer_draw,expected", [(16.01, 16), (16.42, 16), (16.99, 16), (17, 15), (17.2, 15)]
+)
+def test_rounding_tolerance_is_less_than_one_amp(peer_draw, expected):
+    master, (first, second) = setup_pair()
+    master.config["config"]["roundUpSharedCurrent"] = True
+    first.reportedAmpsActual = peer_draw
+    first.isCharging = second.isCharging = True
+    second.lastAmpsOffered = 14
+    master.distributeEVSEPower()
+    with patch("TWCManager.TWCSlave.time.time", return_value=1000):
+        offer = heartbeat(second, 1, 14)
+    assert offer == expected
+    assert peer_draw + offer < 33
+    assert offer <= 16
+
+
+def test_rounding_does_not_raise_policy_fair_share_or_per_charger_cap():
+    master, (first, second) = setup_pair()
+    master.config["config"]["roundUpSharedCurrent"] = True
+    master.getMaxAmpsToDivideAmongSlaves = lambda: 30
+    master.settings["spikeAmpsProactively"] = 0
+    master.settings["spikeAmpsReactively"] = 0
+    first.reportedAmpsActual = 15.42
+    first.isCharging = second.isCharging = True
+    second.lastAmpsOffered = 14
+    master.distributeEVSEPower()
+    with patch("TWCManager.TWCSlave.time.time", return_value=1000):
+        assert heartbeat(second, 1, 14) == 15
+    second.wiringMaxAmps = 12
+    second.lastAmpsOffered = 10
+    with patch("TWCManager.TWCSlave.time.time", return_value=1010):
+        assert heartbeat(second, 1, 10) == 12
+
+
+def test_enabled_flag_keeps_both_16a_offers_stable_with_fractional_reports():
+    master, (first, second) = setup_pair()
+    master.config["config"]["roundUpSharedCurrent"] = True
+    first.reportedAmpsActual = 16.42
+    second.reportedAmpsActual = 15.85
+    first.isCharging = second.isCharging = True
+    with patch("TWCManager.TWCSlave.time.time") as clock:
+        for seconds in range(0, 181, 2):
+            clock.return_value = 1000 + seconds
+            master.distributeEVSEPower()
+            assert heartbeat(first, 1, 16.42) == 16
+            assert heartbeat(second, 1, 15.85) == 16
+
+
+def test_rounding_does_not_apply_to_centralized_targets():
+    master, (first, second) = setup_pair()
+    master.config["config"]["roundUpSharedCurrent"] = True
+    first.reportedAmpsActual = 16.42
+    second._evseTargetAmps = 16
+    second.lastAmpsOffered = 14
+    assert second.set_last_amps_offered(16) == 15

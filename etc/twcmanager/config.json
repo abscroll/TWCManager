@@ -22,6 +22,13 @@
         # CHARGER.
         "wiringMaxAmpsAllTWCs": 6,
 
+        # Optional Gen2 legacy allocation tolerance: round fractional measured
+        # shared headroom UP to the next whole amp, capped by the requested
+        # fair share. This can allow less than 1 A above the measured shared
+        # limit (e.g. 16.42 A + a 16 A offer with a 32 A limit). Default: false.
+        # Enable only when this tolerance is acceptable for the installation.
+        "roundUpSharedCurrent": false,
+
         # If all your chargers share a single circuit breaker, set wiringMaxAmpsPerTWC
         # to the same value as wiringMaxAmpsAllTWCs.
         # Rarely, each TWC will be wired to its own circuit breaker. If you're

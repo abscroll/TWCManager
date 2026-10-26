@@ -1,5 +1,6 @@
 from datetime import datetime
 import logging
+import math
 import re
 import time
 from TWCManager.Logging.LoggerFactory import LoggerFactory
@@ -911,7 +912,16 @@ class TWCSlave:
             # one second and 12.0A the next second, the car reduces its power
             # use to ~5.14-5.23A and refuses to go higher. So it seems best to
             # stick with whole amps.
-            desiredAmpsOffered = int(desiredAmpsOffered)
+            if (
+                self.configConfig.get("roundUpSharedCurrent", False) is True
+                and _centralized_target is None
+                and numCarsCharging > 0
+            ):
+                # The fair-share cap above is already a whole number. Round
+                # fractional measured peer headroom up without raising that cap.
+                desiredAmpsOffered = math.ceil(desiredAmpsOffered)
+            else:
+                desiredAmpsOffered = int(desiredAmpsOffered)
 
             # Mid Oct 2017, Tesla pushed a firmware update to their cars
             # that seems to create the following bug:
@@ -1153,10 +1163,17 @@ class TWCSlave:
                 # allowed this TWC to use desiredAmpsOffered.  Instead, try
                 # offering as many amps as will increase total_amps_actual_all_twcs()
                 # up to wiringMaxAmpsAllTWCs.
-                self.lastAmpsOffered = int(
-                    self.config["config"]["wiringMaxAmpsAllTWCs"]
-                    - (self.master.getTotalAmpsInUse() - self.reportedAmpsActual)
+                headroom = self.config["config"]["wiringMaxAmpsAllTWCs"] - (
+                    self.master.getTotalAmpsInUse() - self.reportedAmpsActual
                 )
+                if (
+                    self.configConfig.get("roundUpSharedCurrent", False) is True
+                    and getattr(self, "_evseTargetAmps", None) is None
+                    and headroom >= self.minAmpsTWCSupports
+                ):
+                    self.lastAmpsOffered = min(desiredAmpsOffered, math.ceil(headroom))
+                else:
+                    self.lastAmpsOffered = int(headroom)
 
                 if self.lastAmpsOffered < self.minAmpsTWCSupports:
                     # Always offer at least minAmpsTWCSupports amps.
@@ -1164,16 +1181,17 @@ class TWCSlave:
                     # 'if(maxAmpsToDivideAmongSlaves / numCarsCharging > minAmpsToOffer):'
                     self.lastAmpsOffered = self.minAmpsTWCSupports
 
-                logger.info(
-                    "WARNING: Offering slave TWC %02X%02X %.1fA instead of "
-                    "%.1fA to avoid overloading wiring shared by all TWCs."
-                    % (
-                        self.TWCID[0],
-                        self.TWCID[1],
-                        self.lastAmpsOffered,
-                        desiredAmpsOffered,
+                if self.lastAmpsOffered != desiredAmpsOffered:
+                    logger.info(
+                        "WARNING: Offering slave TWC %02X%02X %.1fA instead of "
+                        "%.1fA to avoid overloading wiring shared by all TWCs."
+                        % (
+                            self.TWCID[0],
+                            self.TWCID[1],
+                            self.lastAmpsOffered,
+                            desiredAmpsOffered,
+                        )
                     )
-                )
 
             if self.lastAmpsOffered > self.wiringMaxAmps:
                 # We reach this case frequently in some configurations, such as
