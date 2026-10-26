@@ -23,7 +23,7 @@ This document logs the changes per release of TWCManager.
     * (@MikeBishop) - Shut down gracefully on SIGTERM, saving settings and sending pending stop-charging commands before exit (#668)
     * (@MikeBishop) - Evaluate charging policy on its own thread instead of the RS485 loop, only when acting as master (#670)
 * Bugfixes
-    * Fix: Lend an idle Gen2 charger's unused share to the active car, periodically retry declined offers, and wait for acknowledged limits and measured draw before reallocating shared current.
+    * Fix: Preserve the original per-heartbeat allocation for Gen2-only installations even when TeslaAPIController is registered, allowing sustained full current for one charging car and rebalancing from actual current when another starts.
     * Fix: Add missing module-level time import in HASS, EmonCMS, Growatt, IotaWatt, SmartMe and TCP modules, which crashed EMS polling and caused charge current oscillation (closes #644)
     * Fix: Restore minInterval parameter on update_location, fixing TypeError that broke API start/stop charging and home location correction
     * Fix: Correct invalid logging level in update_vehicle_data error handler which crashed when logging a failed API response

@@ -1129,31 +1129,6 @@ class TWCSlave:
     def set_last_amps_offered(self, desiredAmpsOffered):
         # self.lastAmpsOffered should only be changed using this sub.
 
-        if getattr(self, "_evseTargetAmps", None) is not None:
-            # A target reduction is not free capacity until the peer confirms
-            # it. Reserve its last queued offer, acknowledged limit AND actual
-            # draw; this permits either heartbeat order during a handoff.
-            reserved = sum(
-                max(
-                    0,
-                    peer.lastAmpsOffered,
-                    peer.reportedAmpsMax,
-                    peer.reportedAmpsActual,
-                )
-                for peer in self.master.getSlaveTWCs()
-                if peer.TWCID != self.TWCID
-            )
-            available = max(0, self.config["config"]["wiringMaxAmpsAllTWCs"] - reserved)
-            offer = max(0, min(desiredAmpsOffered, self.wiringMaxAmps, available))
-            if 0 < offer < self.minAmpsTWCSupports:
-                offer = 0
-            if offer != self.lastAmpsOffered:
-                self.timeLastAmpsOfferedChanged = time.time()
-            self.lastAmpsOffered = offer
-            self._publishStatus("amps_offered", "ampsOffered", offer, "A")
-            self._publishStatus("amps_desired", "ampsDesired", desiredAmpsOffered, "A")
-            return offer
-
         logger.debug(
             "set_last_amps_offered(TWCID="
             + self.master.hex_str(self.TWCID)

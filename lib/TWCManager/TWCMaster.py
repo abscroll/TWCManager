@@ -514,9 +514,33 @@ class TWCMaster:
         # and more battle-tested for pure Gen2 deployments.
         non_gen2 = [c for c in controllers if c["name"] != "Gen2TWCs"]
         if not non_gen2:
+            for slave in self.getSlaveTWCs():
+                slave._evseTargetAmps = None
             return
 
         evses = self.getDedupedEVSEs()
+        from TWCManager.EVSEInstance.MergedEVSE import MergedEVSE
+
+        def local_gen2(evse):
+            if isinstance(evse, TWCSlave):
+                return True
+            return (
+                isinstance(evse, MergedEVSE)
+                and int(self.settings.get("chargeRateControl", 1)) == 1
+                and any(isinstance(e, TWCSlave) for e in evse.evses)
+                and all(not e.isLocal or isinstance(e, TWCSlave) for e in evse.evses)
+            )
+
+        # Registering TeslaAPIController does not imply that API vehicles need
+        # power. For a Gen2-only installation use the original heartbeat
+        # allocator: actual charging count, measured peer draw, and the existing
+        # ramp/spike and wiring safeguards. Do not override it with stale targets.
+        writable = [e for e in evses if not e.isReadOnly]
+        if all(local_gen2(e) for e in writable):
+            for slave in self.getSlaveTWCs():
+                slave._evseTargetAmps = None
+            return
+
         wants_power = [e for e in evses if e.wantsToCharge and not e.isReadOnly]
 
         if not wants_power:

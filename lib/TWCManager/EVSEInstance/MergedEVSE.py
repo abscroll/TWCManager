@@ -73,9 +73,7 @@ class MergedEVSE(EVSEInstance):
 
     @property
     def wantsToCharge(self) -> bool:
-        # A stale API "Stopped" state must not override a local charger's
-        # declined offer, or it would keep reserving power for an idle car.
-        return any(e.wantsToCharge for e in self._prefer_local())
+        return any(e.wantsToCharge for e in self.evses)
 
     @property
     def currentAmps(self) -> float:

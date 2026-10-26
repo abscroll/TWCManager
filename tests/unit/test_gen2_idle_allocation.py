@@ -1,11 +1,12 @@
-"""Exercise idle lending and asynchronous RS485 handoffs with real Gen2 objects."""
+"""Gen2-only systems must use the 1.3.4 measured-current heartbeat allocator."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from TWCManager.EVSEInstance.Gen2TWC import Gen2TWC
+from TWCManager.EVSEInstance.MergedEVSE import MergedEVSE
 from TWCManager.TWCMaster import TWCMaster
 
 
@@ -16,20 +17,31 @@ def setup_pair():
             "defaultVoltage": 240,
             "numberOfPhases": 1,
             "wiringMaxAmpsAllTWCs": 32,
+            "wiringMaxAmpsPerTWC": 32,
+            "minAmpsPerTWC": 6,
+            "fakeMaster": True,
         }
     }
+    master.settings = {"chargeRateControl": 1}
+    master.queue_background_task = Mock()
+    master.queue_vehicle_command = Mock()
+    master.recordVehicleSessionStart = Mock()
+    master.recordVehicleSessionEnd = Mock()
+    master.updateVINStatus = Mock()
+    master.cancelStopCarsCharging = Mock()
+    master.getMasterHeartbeatOverride = lambda: b""
+    master.getAllowedFlex = lambda: 0
+    master.getSpikeAmps = lambda: 16
+    policy = SimpleNamespace(policyIsGreen=lambda: False, fireWebhook=Mock())
+    master.getModuleByName = lambda name: policy if name == "Policy" else None
     chargers = []
-    for identifier, state, actual in (("5989", 1, 16), ("3156", 3, 0)):
-        evse = Gen2TWC.__new__(Gen2TWC)
-        evse.TWCID = bytes.fromhex(identifier)
-        evse.master = master
-        evse.config = master.config
-        evse.configConfig = master.config["config"]
-        evse.wiringMaxAmps = 32
-        evse.minAmpsTWCSupports = 6
+    for identifier in ("5989", "3156"):
+        evse = Gen2TWC(bytes.fromhex(identifier), 32, master.config, master)
         evse.protocolVersion = 2
-        evse.reportedState = state
-        evse.reportedAmpsActual = actual
+        evse.vehicleRateRaised = True
+        evse.getLastVehicle = lambda: None
+        evse.print_status = Mock()
+        evse.reportedAmpsActual = 0
         evse.reportedAmpsMax = evse.lastAmpsOffered = 16
         evse.voltsPhaseA = 240
         evse.voltsPhaseB = evse.voltsPhaseC = 0
@@ -49,126 +61,94 @@ def setup_pair():
     return master, chargers
 
 
-def send(evse):
-    offer = evse.set_last_amps_offered(evse._evseTargetAmps)
-    payload = evse._amps_heartbeat(offer)
-    if payload[0] == 0:
-        return evse.reportedAmpsMax
-    return int.from_bytes(payload[1:3], "big") / 100
+def heartbeat(evse, state, actual):
+    limit = int(evse.lastAmpsOffered * 100)
+    amps = int(actual * 100)
+    payload = bytes([state, limit >> 8, limit & 255, amps >> 8, amps & 255, 0, 0, 0, 0])
+    evse.receive_slave_heartbeat(payload)
+    command = evse.masterHeartbeatData
+    if command[0]:
+        assert int.from_bytes(command[1:3], "big") / 100 == evse.lastAmpsOffered
+    return evse.lastAmpsOffered
 
 
-def release_idle(master, active, idle, clock):
-    clock.return_value = 100
+def test_registered_but_unused_api_controller_does_not_split_gen2_budget():
+    master, chargers = setup_pair()
+    for evse in chargers:
+        evse._evseTargetAmps = 16
     master.distributeEVSEPower()
-    clock.return_value = 111
-    master.distributeEVSEPower()
-    assert idle._evseTargetAmps == 0
-    assert active._evseTargetAmps == 32
-    # Merely queuing the idle reduction must NOT release its acknowledged 16A.
-    assert send(idle) == 0
-    assert send(active) == 16
-    idle.reportedAmpsMax = 0  # RS485 acknowledgement
-    assert send(active) == 32
-    active.reportedAmpsMax = active.reportedAmpsActual = 32
+    assert all(e._evseTargetAmps is None for e in chargers)
+
+
+@pytest.mark.parametrize("idle_states", [(3,), (3, 9)])
+def test_full_32a_offer_survives_slow_ramp_and_idle_state_changes(idle_states):
+    master, (active, idle) = setup_pair()
+    with patch("TWCManager.TWCSlave.time.time") as clock:
+        # Three minutes, including the former 10s cut-off and 60s retry boundaries.
+        for seconds in range(0, 181, 2):
+            clock.return_value = 1000 + seconds
+            master.distributeEVSEPower()
+            heartbeat(idle, idle_states[(seconds // 2) % len(idle_states)], 0)
+            actual = min(32, 17.7 + seconds / 12)
+            assert heartbeat(active, 1, actual) == 32
+            assert master.num_cars_charging_now() == 1
 
 
 @pytest.mark.parametrize("order", [(0, 1), (1, 0)])
-def test_idle_releases_full_32a_then_resume_rebalances_safely(order):
+def test_second_car_start_rebalances_from_actual_draw(order):
     master, (active, idle) = setup_pair()
-    with patch("TWCManager.EVSEInstance.Gen2TWC.time.monotonic") as clock:
-        release_idle(master, active, idle, clock)
-        clock.return_value = 120
+    with patch("TWCManager.TWCSlave.time.time") as clock:
+        clock.return_value = 1000
         master.distributeEVSEPower()
-        assert active._evseTargetAmps == 32
-        assert idle._evseTargetAmps == 0
-        # The second car wakes before its periodic retry, requesting charge.
-        idle.reportedState = 4
-        master.distributeEVSEPower()
-        assert [active._evseTargetAmps, idle._evseTargetAmps] == [16, 16]
-        for index in order:
-            send((active, idle)[index])
-        assert idle.lastAmpsOffered == 0
-        assert active.lastAmpsOffered == 16
-        assert send(idle) == 0  # old active limit has not been acknowledged
-        active.reportedAmpsMax = 16
-        assert send(idle) == 0  # active car still drawing its former 32A
-        active.reportedAmpsActual = 16
-        assert send(idle) == 16
-        idle.reportedAmpsMax = idle.reportedAmpsActual = 16
-        idle.reportedState = 1
+        heartbeat(active, 1, 32)
+        heartbeat(idle, 3, 0)
+        assert active.lastAmpsOffered == 32
+        assert idle.lastAmpsOffered >= 6  # continuous readiness; no timed shutoff
+        for step in range(10):
+            clock.return_value = 1020 + step * 10
+            for index in order:
+                evse = (active, idle)[index]
+                heartbeat(evse, 1, 16 if index == 0 else 6 + min(step * 2, 10))
+            master.distributeEVSEPower()
+        assert master.num_cars_charging_now() == 2
+        assert active.lastAmpsOffered == idle.lastAmpsOffered == 16
         assert active.reportedAmpsActual + idle.reportedAmpsActual == 32
 
 
-def test_periodic_probe_recovers_without_state_change():
+def test_five_second_session_end_debounce_restores_full_offer():
     master, (active, idle) = setup_pair()
-    with patch("TWCManager.EVSEInstance.Gen2TWC.time.monotonic") as clock:
-        release_idle(master, active, idle, clock)
-        clock.return_value = 170
+    with patch("TWCManager.TWCSlave.time.time") as clock:
+        clock.return_value = 1000
         master.distributeEVSEPower()
-        assert idle._evseTargetAmps == 0
-        clock.return_value = 171
-        master.distributeEVSEPower()
-        assert [active._evseTargetAmps, idle._evseTargetAmps] == [16, 16]
-        assert send(idle) == 0
-        assert send(active) == 16
-        # A probe waiting for capacity must not time out before it can start.
-        clock.return_value = 200
-        master.distributeEVSEPower()
-        assert idle._evseTargetAmps == 16
-        active.reportedAmpsMax = active.reportedAmpsActual = 16
-        assert send(idle) == 16
-        idle.reportedAmpsMax = 16
-        clock.return_value = 201
-        master.distributeEVSEPower()
-        clock.return_value = 212
-        master.distributeEVSEPower()
-        assert idle._evseTargetAmps == 0  # declined again: release its share
-        assert active._evseTargetAmps == 32
+        heartbeat(active, 1, 16)
+        heartbeat(idle, 1, 16)
+        clock.return_value = 1010
+        heartbeat(idle, 3, 0)
+        assert master.num_cars_charging_now() == 2
+        clock.return_value = 1016
+        # Above the existing reactive-spike threshold; ramp remains slow.
+        assert heartbeat(active, 1, 17.7) == 32
+        assert master.num_cars_charging_now() == 1
 
 
-def test_no_grace_reservation_for_unplugged_car():
+def test_duplicate_api_view_of_gen2_still_uses_legacy_allocator():
     master, (active, idle) = setup_pair()
-    idle.reportedState = 0
-    idle.reportedAmpsMax = idle.lastAmpsOffered = 0
-    master.distributeEVSEPower()
-    assert active._evseTargetAmps == 32
-    assert idle._evseTargetAmps == 0
-
-
-def test_idle_does_not_lose_share_during_initial_grace():
-    master, (_, idle) = setup_pair()
-    with patch("TWCManager.EVSEInstance.Gen2TWC.time.monotonic") as clock:
-        for now in (100, 105, 109):
-            clock.return_value = now
-            master.distributeEVSEPower()
-            assert idle._evseTargetAmps == 16
-
-
-def test_merged_api_stopped_state_cannot_restore_idle_reservation():
-    from TWCManager.EVSEInstance.MergedEVSE import MergedEVSE
-
-    master, (active, idle) = setup_pair()
-    api = SimpleNamespace(isLocal=False, wantsToCharge=True)
+    api = SimpleNamespace(isLocal=False, isReadOnly=True)
     merged = MergedEVSE(master, idle, api)
-    with patch("TWCManager.EVSEInstance.Gen2TWC.time.monotonic") as clock:
-        release_idle(master, active, idle, clock)
-        assert not merged.wantsToCharge
-        idle.reportedState = 4
-        assert merged.wantsToCharge
+    master.getDedupedEVSEs = lambda: [active, merged]
+    master.distributeEVSEPower()
+    assert active._evseTargetAmps is idle._evseTargetAmps is None
 
 
-def test_resumed_current_cancels_idle_backoff():
+def test_mixed_controllable_api_vehicle_retains_central_distributor():
     master, (active, idle) = setup_pair()
-    with patch("TWCManager.EVSEInstance.Gen2TWC.time.monotonic") as clock:
-        release_idle(master, active, idle, clock)
-        idle.reportedAmpsActual = 1
-        master.distributeEVSEPower()
-        assert idle._evseTargetAmps == 16
-
-
-def test_less_than_minimum_free_capacity_stays_off():
-    master, (active, idle) = setup_pair()
-    active.reportedAmpsMax = active.reportedAmpsActual = active.lastAmpsOffered = 29
-    idle.reportedAmpsMax = idle.lastAmpsOffered = 0
-    idle._evseTargetAmps = 16
-    assert send(idle) == 0  # never force 6A when only 3A is free
+    api = Mock()
+    api.isReadOnly = False
+    api.wantsToCharge = True
+    api.maxPower = 32 * 240
+    api.minPower = 6 * 240
+    api.controllers = ["TeslaAPIController"]
+    master.getDedupedEVSEs = lambda: [active, idle, api]
+    master.distributeEVSEPower()
+    assert active._evseTargetAmps is not None
+    api.setTargetPower.assert_called_once()
