@@ -7,6 +7,8 @@ participate in the controller-agnostic power distribution algorithm.
 Ported from ngardiner/TWCManager#483 (MikeBishop); adapted for current main.
 """
 
+import time
+
 from TWCManager.EVSEInstance.EVSEInstance import EVSEInstance
 from TWCManager.TWCSlave import TWCSlave
 
@@ -80,11 +82,37 @@ class Gen2TWC(EVSEInstance, TWCSlave):
 
     @property
     def wantsToCharge(self) -> bool:
-        """True when a vehicle is plugged in and willing to accept power.
+        """Release a declined offer, periodically probing for renewed demand.
 
-        TWC heartbeat: reportedAmpsMax is non-zero once the vehicle has
-        communicated its maximum charge rate (i.e. it's plugged in and awake).
+        State 03 can retain a nonzero advertised limit after the car stops.
+        Give it ten seconds with usable power before lending its share, and
+        retry after a minute so stopping our offer cannot strand the car.
+        A change of state or resumed current immediately restores eligibility.
         """
+        now = time.monotonic()
+        if self.reportedState == 0x03 and self.reportedAmpsActual < 1:
+            retry = getattr(self, "_idleRetryAt", 0)
+            if now < retry:
+                return False
+            if retry:
+                self._idleRetryAt = 0
+                self._idleOfferSince = None
+            since = getattr(self, "_idleOfferSince", None)
+            if self.lastAmpsOffered >= self.minAmpsTWCSupports:
+                if since is None:
+                    self._idleOfferSince = now
+                elif now - since >= 10:
+                    self._idleRetryAt = now + 60
+                    self._idleOfferSince = None
+                    return False
+            else:
+                # Start the grace period only once the probe has capacity.
+                self._idleOfferSince = None
+            return True
+        self._idleRetryAt = 0
+        self._idleOfferSince = None
+        if self.reportedState in (0x04, 0x08):
+            return True
         return self.reportedAmpsMax > 0 or self.reportedAmpsActual > 0
 
     @property
